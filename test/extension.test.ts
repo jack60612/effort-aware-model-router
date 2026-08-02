@@ -288,6 +288,7 @@ describe("model router extension", () => {
 		expect(harness.classifierPrompts).toEqual(["rename this symbol", "debug this cross-system race"]);
 		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["smol", "slow"]);
 		expect(harness.state().lastDecision).toMatchObject({ effort: "high", selector: "@slow", outcome: "routed" });
+		expect(harness.statuses.at(-1)).toContain("baseline mock/base");
 	});
 
 	it("avoids same-model resets, clamps effort, and does not mutate thinking for plain targets", async () => {
@@ -624,6 +625,8 @@ describe("model router extension", () => {
 		expect(messages).toContain("Candidates");
 		expect(messages).toContain("history");
 		expect(messages).toContain("@slow");
+		expect(messages).toContain("Classifier minimum: 0 characters");
+		expect(messages).toContain("Classifier cooldown: 0 ms");
 	});
 
 	it("restores legacy version-1 state through the lifecycle hook", async () => {

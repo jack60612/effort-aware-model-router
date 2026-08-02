@@ -71,9 +71,16 @@ function modelLabel(model: ModelIdentity | null): string {
 	return model ? `${model.provider}/${model.id}` : "unavailable";
 }
 
-function formatDecisionExplanation(state: RouterState): string {
+function formatDecisionExplanation(state: RouterState, config: RouterConfig): string {
+	const classifierGuards = [
+		`Classifier minimum: ${config.classifierMinPromptChars} characters`,
+		`Classifier cooldown: ${config.classifierCooldownMs} ms`,
+		`Last classified at: ${state.lastClassifiedAt ?? "never"}`,
+	];
 	const decision = state.lastDecision;
-	if (!decision) return `No routing decision yet. Baseline: ${modelLabel(state.baseline)}`;
+	if (!decision) {
+		return [`No routing decision yet.`, `Baseline: ${modelLabel(state.baseline)}`, ...classifierGuards].join("\n");
+	}
 	const attempts =
 		decision.attempts.length > 0
 			? decision.attempts.map(attempt => `${attempt.selector}=${attempt.outcome}`).join(", ")
@@ -87,7 +94,7 @@ function formatDecisionExplanation(state: RouterState): string {
 		`Profile effort: ${decision.profileEffort ?? "none"}`,
 		`Applied thinking: ${decision.thinking ?? "none"}`,
 		`Reason: ${decision.reason ?? "none"}`,
-		`Classified at: ${state.lastClassifiedAt ?? "never"}`,
+		...classifierGuards,
 	].join("\n");
 }
 
@@ -107,7 +114,7 @@ function routeStatus(state: RouterState): string {
 	const decision = state.lastDecision;
 	if (!decision) return `route:${state.mode} · baseline ${modelLabel(state.baseline)}`;
 	const effort = decision.effort ?? "failed";
-	return `route:${state.mode} · ${effort} → ${modelLabel(decision.target)} · ${decision.outcome}`;
+	return `route:${state.mode} · baseline ${modelLabel(state.baseline)} · ${effort} → ${modelLabel(decision.target)} · ${decision.outcome}`;
 }
 
 function currentModel(ctx: ExtensionContext): Model | undefined {
@@ -520,7 +527,7 @@ export function createModelRouterExtension(
 					return;
 				}
 				if (command === "explain" && parts.length === 1) {
-					ctx.ui.notify(formatDecisionExplanation(ensureState(ctx)), "info");
+					ctx.ui.notify(formatDecisionExplanation(ensureState(ctx), config), "info");
 					return;
 				}
 				if (command === "history" && parts.length === 1) {
