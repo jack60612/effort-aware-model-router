@@ -34,7 +34,7 @@ describe("loadRouterConfig", () => {
 			thresholds: { low: ["@smol"], high: ["@slow"] },
 			classifierModels: ["@tiny", "@smol"],
 			maxEffort: "xhigh",
-			classifierTimeoutMs: 4_000,
+			classifierTimeoutMs: 20_000,
 			classifierMinPromptChars: 30,
 			classifierCooldownMs: 30_000,
 			thinkingProfiles: {},

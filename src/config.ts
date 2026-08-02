@@ -41,7 +41,7 @@ export const DEFAULT_ROUTER_CONFIG: Readonly<RouterConfig> = Object.freeze({
 	}),
 	classifierModels: Object.freeze(["@tiny", "@smol"]),
 	maxEffort: "xhigh",
-	classifierTimeoutMs: 4_000,
+	classifierTimeoutMs: 20_000,
 	classifierMinPromptChars: 30,
 	classifierCooldownMs: 30_000,
 	thinkingProfiles: Object.freeze({}),
