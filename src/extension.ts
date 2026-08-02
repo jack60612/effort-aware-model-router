@@ -12,6 +12,7 @@ import type {
 	SessionTreeEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import { classifyPromptEffort } from "./classifier";
+import { runRouterSetup, type RouterSetupContext } from "./setup";
 import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, type RouteEffort, type RouterConfig } from "./config";
 import {
 	clampEffortToModel,
@@ -60,6 +61,7 @@ export interface ModelRouterExtensionDependencies {
 	loadConfig: LoadConfig;
 	classify: Classify;
 	now?: () => number;
+	setup?: typeof runRouterSetup;
 }
 
 function identityOf(model: Pick<Model, "provider" | "id"> | undefined): ModelIdentity | null {
@@ -152,6 +154,7 @@ export function createModelRouterExtension(
 	const readConfig = dependencies.loadConfig ?? loadRouterConfig;
 	const classify = dependencies.classify ?? classifyPromptEffort;
 	const now = dependencies.now ?? Date.now;
+	const setup = dependencies.setup ?? runRouterSetup;
 
 	return (pi: ExtensionAPI): void => {
 		let config = defaultConfig();
@@ -535,6 +538,38 @@ export function createModelRouterExtension(
 					armOneShotSelector(runtime, selector);
 					persist(ctx);
 					ctx.ui.notify(`One-shot routing armed for ${selector}`, "info");
+					return;
+				}
+				if (command === "setup" && parts.length === 1) {
+					const setupContext: RouterSetupContext = {
+						cwd: ctx.cwd,
+						hasUI: ctx.hasUI,
+						ui: {
+							select: (title, options) => ctx.ui.select(title, options),
+							input: (title, placeholder) => ctx.ui.input(title, placeholder),
+							confirm: (title, message) => ctx.ui.confirm(title, message),
+							notify: (message, type) => ctx.ui.notify(message, type),
+						},
+						models: {
+							list: () =>
+								ctx.models.list().map(model => ({
+									provider: model.provider,
+									id: model.id,
+									name: model.name,
+								})),
+						},
+					};
+					const result = await setup(setupContext, config);
+					if (result.status === "written") {
+						config = await readConfig({ cwd: ctx.cwd });
+						const runtime = ensureState(ctx);
+						if (!config.enabled && runtime.mode === "auto") {
+							runtime.mode = "off";
+							persist(ctx);
+						} else {
+							ctx.ui.setStatus(STATUS_KEY, routeStatus(runtime));
+						}
+					}
 					return;
 				}
 				if (command === "reload" && parts.length === 1) {

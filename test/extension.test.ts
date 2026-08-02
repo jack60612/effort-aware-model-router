@@ -8,6 +8,7 @@ import type {
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent";
 import type { RouteEffort, RouterConfig } from "../src/config";
+import type { RouterSetupContext } from "../src/setup";
 import { createModelRouterExtension } from "../src/extension";
 import {
 	createRouterState,
@@ -82,6 +83,8 @@ class Harness {
 	config = routerConfig();
 	now = 1_000;
 	loadCount = 0;
+	setupCalls = 0;
+	setupContexts: RouterSetupContext[] = [];
 	classifications: Array<RouteEffort | Error> = ["low"];
 
 	readonly selectors = new Map<string, TestModel>([
@@ -181,6 +184,11 @@ class Harness {
 				return next;
 			},
 			now: () => this.now,
+			setup: async context => {
+				this.setupCalls += 1;
+				this.setupContexts.push(context);
+				return { status: "written", path: "/project/.omp/model-router.json" };
+			},
 		})(this.api);
 	}
 
@@ -340,6 +348,18 @@ describe("model router extension", () => {
 		await harness.command("reload");
 		expect(harness.loadCount).toBe(2);
 		expect(harness.notifications.some(item => item.message.includes("reloaded"))).toBe(true);
+	});
+	it("routes /route setup through the public UI seam and reloads written config", async () => {
+		const harness = new Harness();
+		await harness.lifecycle();
+		await harness.command("setup");
+
+		expect(harness.setupCalls).toBe(1);
+		expect(harness.loadCount).toBe(2);
+		expect(harness.setupContexts[0]?.hasUI).toBe(true);
+		expect(harness.setupContexts[0]?.models.list().map(model => `${model.provider}/${model.id}`)).toContain(
+			"mock/smol",
+		);
 	});
 
 	it("intercepts exact interactive /model auto as the auto command alias", async () => {

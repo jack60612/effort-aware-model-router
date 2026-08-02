@@ -1,0 +1,192 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { type RouterConfig, ROUTER_EFFORTS } from "../src/config";
+import {
+	runRouterSetup,
+	writeRouterConfigLayer,
+	type RouterSetupContext,
+	type RouterSetupValues,
+} from "../src/setup";
+
+let root: string;
+let homeDir: string;
+let cwd: string;
+
+const config: RouterConfig = {
+	enabled: true,
+	thresholds: { low: ["@smol"], high: ["@slow"] },
+	classifierModels: ["@tiny", "@smol"],
+	maxEffort: "xhigh",
+	classifierTimeoutMs: 4_000,
+	classifierMinPromptChars: 0,
+	classifierCooldownMs: 0,
+	thinkingProfiles: {},
+};
+
+function values(overrides: Partial<RouterSetupValues> = {}): RouterSetupValues {
+	return {
+		enabled: true,
+		thresholds: { low: ["mock/low"] },
+		classifierModels: ["@tiny"],
+		classifierMinPromptChars: 4,
+		classifierCooldownMs: 500,
+		thinkingProfiles: { "mock/low": { default: "low", xhigh: "medium" } },
+		...overrides,
+	};
+}
+
+class FakeUI {
+	readonly selected: string[] = [];
+	readonly entered: string[] = [];
+	readonly confirmed: boolean[] = [];
+	readonly notifications: string[] = [];
+
+	constructor(
+		private readonly selections: Array<string | undefined>,
+		private readonly inputs: Array<string | undefined>,
+		private readonly confirmations: boolean[] = [],
+	) {}
+
+	async select(): Promise<string | undefined> {
+		return this.selections.shift();
+	}
+
+	async input(): Promise<string | undefined> {
+		return this.inputs.shift();
+	}
+
+	async confirm(): Promise<boolean> {
+		return this.confirmations.shift() ?? false;
+	}
+
+	notify(message: string): void {
+		this.notifications.push(message);
+	}
+}
+
+function setupContext(ui: FakeUI, hasUI = true): RouterSetupContext {
+	return {
+		cwd,
+		homeDir,
+		hasUI,
+		ui,
+		models: {
+			list: () => [
+				{ provider: "mock", id: "base", name: "Base" },
+				{ provider: "mock", id: "smol", name: "Smol" },
+			],
+		},
+	};
+}
+
+beforeEach(async () => {
+	root = await fs.mkdtemp(path.join(os.tmpdir(), "model-router-setup-"));
+	homeDir = path.join(root, "home");
+	cwd = path.join(root, "project");
+	await fs.mkdir(homeDir, { recursive: true });
+	await fs.mkdir(cwd, { recursive: true });
+});
+
+afterEach(async () => {
+	await fs.rm(root, { recursive: true, force: true });
+});
+
+describe("writeRouterConfigLayer", () => {
+	it("preserves unrelated JSON fields while replacing known router fields", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				unrelated: { keep: true },
+				thresholds: { unknown: "keep", low: ["old"] },
+				thinkingProfiles: { other: { custom: "keep" } },
+			}),
+		);
+
+		await writeRouterConfigLayer(file, values());
+		const written = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+
+		expect(written.unrelated).toEqual({ keep: true });
+		expect(written.thresholds).toEqual({ unknown: "keep", low: ["mock/low"] });
+		expect(written.thinkingProfiles).toEqual({
+			other: { custom: "keep" },
+			"mock/low": { default: "low", xhigh: "medium" },
+		});
+		expect(written.enabled).toBe(true);
+	});
+
+	it("refuses malformed existing JSON without changing it", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		const original = "{not-json";
+		await fs.writeFile(file, original);
+
+		await expect(writeRouterConfigLayer(file, values())).rejects.toThrow();
+		expect(await fs.readFile(file, "utf8")).toBe(original);
+	});
+});
+
+describe("runRouterSetup", () => {
+	it("writes a confirmed project setup with ordered candidates and a model profile", async () => {
+		const ui = new FakeUI(
+			[
+				"project",
+				"enabled",
+				"low",
+				"mock/smol",
+				"done",
+				"mock/smol",
+				"low",
+				"medium",
+				"inherit",
+				"done",
+			],
+			["4", "500", "@tiny, @smol"],
+			[false, true],
+		);
+		const result = await runRouterSetup(setupContext(ui), config);
+
+		expect(result.status).toBe("written");
+		const written = JSON.parse(
+			await fs.readFile(path.join(cwd, ".omp", "model-router.json"), "utf8"),
+		) as Record<string, unknown>;
+		expect(written).toMatchObject({
+			enabled: true,
+			classifierModels: ["@tiny", "@smol"],
+			classifierMinPromptChars: 4,
+			classifierCooldownMs: 500,
+			thresholds: { low: ["mock/smol"], high: ["@slow"] },
+			thinkingProfiles: { "mock/smol": { default: "low", xhigh: "medium" } },
+		});
+	});
+
+	it("does not write when cancelled or when the UI surface is unavailable", async () => {
+		const cancelled = await runRouterSetup(setupContext(new FakeUI([undefined], [])), config);
+		expect(cancelled.status).toBe("cancelled");
+		expect(await fs.stat(path.join(cwd, ".omp", "model-router.json")).catch(() => undefined)).toBeUndefined();
+
+		const unsupported = await runRouterSetup(setupContext(new FakeUI([], []), false), config);
+		expect(unsupported.status).toBe("unsupported");
+		expect(await fs.stat(path.join(cwd, ".omp", "model-router.json")).catch(() => undefined)).toBeUndefined();
+	});
+
+	it("keeps the file unchanged when final confirmation is declined", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		const original = JSON.stringify({ keep: "yes" });
+		await fs.writeFile(file, original);
+		const ui = new FakeUI(["project", "enabled"], ["0", "0", "@tiny"], [false]);
+
+		const result = await runRouterSetup(setupContext(ui), config);
+
+		expect(result.status).toBe("cancelled");
+		expect(await fs.readFile(file, "utf8")).toBe(original);
+	});
+
+	it("exposes all configurable route effort names to the wizard contract", () => {
+		expect(ROUTER_EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max"]);
+	});
+});
