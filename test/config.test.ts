@@ -29,7 +29,16 @@ describe("loadRouterConfig", () => {
 	it("uses safe defaults when no config files exist", async () => {
 		const config = await loadRouterConfig({ cwd, homeDir, env: {} });
 
-		expect(config).toEqual(DEFAULT_ROUTER_CONFIG);
+		expect(config).toEqual({
+			enabled: true,
+			thresholds: { low: ["@smol"], high: ["@slow"] },
+			classifierModels: ["@tiny", "@smol"],
+			maxEffort: "xhigh",
+			classifierTimeoutMs: 4_000,
+			classifierMinPromptChars: 0,
+			classifierCooldownMs: 0,
+			thinkingProfiles: {},
+		});
 		expect(config).not.toBe(DEFAULT_ROUTER_CONFIG);
 		expect(config.thresholds).not.toBe(DEFAULT_ROUTER_CONFIG.thresholds);
 	});
@@ -63,15 +72,46 @@ describe("loadRouterConfig", () => {
 		expect(config).toEqual({
 			enabled: true,
 			thresholds: {
-				low: "user/low",
-				medium: "user/medium",
-				high: "project/high",
-				xhigh: "explicit/xhigh",
+				low: ["user/low"],
+				medium: ["user/medium"],
+				high: ["project/high"],
+				xhigh: ["explicit/xhigh"],
 			},
 			classifierModels: ["@tiny"],
 			maxEffort: "max",
 			classifierTimeoutMs: 2_500,
+			classifierMinPromptChars: 0,
+			classifierCooldownMs: 0,
+			thinkingProfiles: {},
 		});
+	});
+	
+	it("merges candidate lists by effort and profiles by exact model key", async () => {
+		await writeJson(path.join(homeDir, ".omp", "agent", "model-router.json"), {
+			thresholds: { low: ["user/low", "user/fallback"] },
+			thinkingProfiles: {
+				"openai/gpt-5": { default: "low", xhigh: "high" },
+				"openai/other": { default: "medium" },
+			},
+			classifierMinPromptChars: 10,
+		});
+		await writeJson(path.join(cwd, ".omp", "model-router.json"), {
+			thresholds: { low: ["project/low"] },
+			thinkingProfiles: {
+				"openai/gpt-5": { xhigh: "medium", max: "medium" },
+			},
+			classifierCooldownMs: 1_000,
+		});
+
+		const config = await loadRouterConfig({ cwd, homeDir, env: {} });
+
+		expect(config.thresholds.low).toEqual(["project/low"]);
+		expect(config.thinkingProfiles).toEqual({
+			"openai/gpt-5": { default: "low", xhigh: "medium", max: "medium" },
+			"openai/other": { default: "medium" },
+		});
+		expect(config.classifierMinPromptChars).toBe(10);
+		expect(config.classifierCooldownMs).toBe(1_000);
 	});
 
 	it("ignores missing, malformed, and non-object config files", async () => {
@@ -110,7 +150,7 @@ describe("parseRouterConfigLayer", () => {
 		input.classifierModels = [" @tiny ", "", 12, "@smol"];
 
 		expect(parseRouterConfigLayer(input)).toEqual({
-			thresholds: { low: "own/low", max: "own/max" },
+			thresholds: { low: ["own/low"], max: ["own/max"] },
 			classifierModels: ["@tiny", "@smol"],
 		});
 	});
@@ -135,5 +175,64 @@ describe("parseRouterConfigLayer", () => {
 		expect(parseRouterConfigLayer(input)).toEqual({ thresholds: {} });
 		expect(parseRouterConfigLayer(null)).toEqual({});
 		expect(parseRouterConfigLayer([])).toEqual({});
+	});
+	
+	it("normalizes threshold arrays and validates timing and thinking-profile fields", () => {
+		const inheritedProfile = { default: "high" };
+		const profile = Object.create(inheritedProfile) as Record<string, unknown>;
+		profile.low = " low ";
+		profile.xhigh = " medium ";
+		const input = {
+			thresholds: {
+				low: " @fast ",
+				medium: [" @medium ", "", 42, " @fallback "],
+				high: ["@high"],
+				max: [],
+			},
+			classifierMinPromptChars: 0,
+			classifierCooldownMs: 1_000,
+			thinkingProfiles: {
+				"openai/gpt-5": profile,
+				"openai/partial": { default: "invalid", max: " max " },
+				"": { default: "low" },
+			},
+		};
+
+		expect(parseRouterConfigLayer(input)).toEqual({
+			thresholds: {
+				low: ["@fast"],
+				medium: ["@medium", "@fallback"],
+				high: ["@high"],
+			},
+			classifierMinPromptChars: 0,
+			classifierCooldownMs: 1_000,
+			thinkingProfiles: {
+				"openai/gpt-5": { low: "low", xhigh: "medium" },
+				"openai/partial": { max: "max" },
+			},
+		});
+	});
+	
+	it("ignores invalid timing values and malformed profile roots", () => {
+		expect(
+			parseRouterConfigLayer({
+				classifierMinPromptChars: -1,
+				classifierCooldownMs: 1.5,
+				thinkingProfiles: {
+					"openai/gpt-5": [],
+					"openai/other": { default: "low", unknown: "high" },
+				},
+			}),
+		).toEqual({
+			thinkingProfiles: {
+				"openai/other": { default: "low" },
+			},
+		});
+		expect(
+			parseRouterConfigLayer({
+				classifierMinPromptChars: Number.MAX_SAFE_INTEGER + 1,
+				classifierCooldownMs: Number.POSITIVE_INFINITY,
+			}),
+		).toEqual({});
 	});
 });

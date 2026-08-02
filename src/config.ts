@@ -5,7 +5,13 @@ import * as path from "node:path";
 export const ROUTER_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 export type RouteEffort = (typeof ROUTER_EFFORTS)[number];
-export type RouterThresholds = Partial<Record<RouteEffort, string>>;
+export type RouterThinkingEffort = "minimal" | RouteEffort;
+export type RouterThresholdInput = string | readonly string[];
+export type RouterThresholds = Partial<Record<RouteEffort, readonly string[]>>;
+export type RouterThinkingProfile = Partial<
+	Record<"default" | RouteEffort, RouterThinkingEffort>
+>;
+export type RouterThinkingProfiles = Record<string, RouterThinkingProfile>;
 
 export interface RouterConfig {
 	enabled: boolean;
@@ -13,10 +19,14 @@ export interface RouterConfig {
 	classifierModels: readonly string[];
 	maxEffort: RouteEffort;
 	classifierTimeoutMs: number;
+	classifierMinPromptChars: number;
+	classifierCooldownMs: number;
+	thinkingProfiles: RouterThinkingProfiles;
 }
 
-export type RouterConfigLayer = Partial<Omit<RouterConfig, "thresholds">> & {
+export type RouterConfigLayer = Partial<Omit<RouterConfig, "thresholds" | "thinkingProfiles">> & {
 	thresholds?: RouterThresholds;
+	thinkingProfiles?: RouterThinkingProfiles;
 };
 
 export interface LoadRouterConfigOptions {
@@ -28,12 +38,15 @@ export interface LoadRouterConfigOptions {
 export const DEFAULT_ROUTER_CONFIG: Readonly<RouterConfig> = Object.freeze({
 	enabled: true,
 	thresholds: Object.freeze({
-		low: "@smol",
-		high: "@slow",
+		low: Object.freeze(["@smol"]),
+		high: Object.freeze(["@slow"]),
 	}),
 	classifierModels: Object.freeze(["@tiny", "@smol"]),
 	maxEffort: "xhigh",
 	classifierTimeoutMs: 4_000,
+	classifierMinPromptChars: 0,
+	classifierCooldownMs: 0,
+	thinkingProfiles: Object.freeze({}),
 });
 
 function hasOwn(record: object, key: PropertyKey): boolean {
@@ -44,10 +57,33 @@ function isRouteEffort(value: unknown): value is RouteEffort {
 	return typeof value === "string" && ROUTER_EFFORTS.some(effort => effort === value);
 }
 
+function isThinkingEffort(value: unknown): value is RouterThinkingEffort {
+	return value === "minimal" || isRouteEffort(value);
+}
+
+function isSafeRecordKey(value: string): boolean {
+	return value !== "__proto__" && value !== "constructor" && value !== "prototype";
+}
+
 function cleanSelector(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const selector = value.trim();
 	return selector.length > 0 ? selector : undefined;
+}
+
+function cleanSelectors(value: unknown): string[] | undefined {
+	if (typeof value === "string") {
+		const selector = cleanSelector(value);
+		return selector ? [selector] : undefined;
+	}
+	if (!Array.isArray(value)) return undefined;
+	const selectors: string[] = [];
+	for (let index = 0; index < value.length; index += 1) {
+		if (!hasOwn(value, index)) continue;
+		const selector = cleanSelector(value[index]);
+		if (selector !== undefined) selectors.push(selector);
+	}
+	return selectors.length > 0 ? selectors : undefined;
 }
 
 /** Validate one untrusted config object without reading inherited properties. */
@@ -70,8 +106,8 @@ export function parseRouterConfigLayer(value: unknown): RouterConfigLayer {
 		const thresholds: RouterThresholds = {};
 		for (const effort of ROUTER_EFFORTS) {
 			if (!hasOwn(inputThresholds, effort)) continue;
-			const selector = cleanSelector(inputThresholds[effort]);
-			if (selector !== undefined) thresholds[effort] = selector;
+			const selectors = cleanSelectors(inputThresholds[effort]);
+			if (selectors !== undefined) thresholds[effort] = selectors;
 		}
 		layer.thresholds = thresholds;
 	}
@@ -99,6 +135,43 @@ export function parseRouterConfigLayer(value: unknown): RouterConfigLayer {
 		layer.classifierTimeoutMs = input.classifierTimeoutMs;
 	}
 
+	for (const field of ["classifierMinPromptChars", "classifierCooldownMs"] as const) {
+		if (
+			hasOwn(input, field) &&
+			typeof input[field] === "number" &&
+			Number.isSafeInteger(input[field]) &&
+			input[field] >= 0
+		) {
+			layer[field] = input[field];
+		}
+	}
+
+	if (
+		hasOwn(input, "thinkingProfiles") &&
+		typeof input.thinkingProfiles === "object" &&
+		input.thinkingProfiles !== null &&
+		!Array.isArray(input.thinkingProfiles)
+	) {
+		const profiles: RouterThinkingProfiles = {};
+		const inputProfiles = input.thinkingProfiles as Record<string, unknown>;
+		for (const [modelKey, rawProfile] of Object.entries(inputProfiles)) {
+			if (!hasOwn(inputProfiles, modelKey) || !isSafeRecordKey(modelKey)) continue;
+			const normalizedModelKey = cleanSelector(modelKey);
+			if (!normalizedModelKey || !isSafeRecordKey(normalizedModelKey)) continue;
+			if (typeof rawProfile !== "object" || rawProfile === null || Array.isArray(rawProfile)) continue;
+			const profile: RouterThinkingProfile = {};
+			const inputProfile = rawProfile as Record<string, unknown>;
+			for (const key of ["default", ...ROUTER_EFFORTS] as const) {
+				if (!hasOwn(inputProfile, key)) continue;
+				const effort = typeof inputProfile[key] === "string" ? inputProfile[key].trim() : undefined;
+				if (!isThinkingEffort(effort)) continue;
+				profile[key] = effort;
+			}
+			if (Object.keys(profile).length > 0) profiles[normalizedModelKey] = profile;
+		}
+		layer.thinkingProfiles = profiles;
+	}
+
 	return layer;
 }
 
@@ -112,12 +185,33 @@ async function readConfigLayer(file: string): Promise<RouterConfigLayer> {
 }
 
 function mergeConfig(base: RouterConfig, layer: RouterConfigLayer): RouterConfig {
+	const thinkingProfiles: RouterThinkingProfiles = {};
+	for (const [modelKey, profile] of Object.entries(base.thinkingProfiles)) {
+		if (!isSafeRecordKey(modelKey)) continue;
+		thinkingProfiles[modelKey] = { ...profile };
+	}
+	for (const [modelKey, profile] of Object.entries(layer.thinkingProfiles ?? {})) {
+		if (!isSafeRecordKey(modelKey)) continue;
+		thinkingProfiles[modelKey] = {
+			...thinkingProfiles[modelKey],
+			...profile,
+		};
+	}
 	return {
 		enabled: layer.enabled ?? base.enabled,
-		thresholds: { ...base.thresholds, ...layer.thresholds },
+		thresholds: Object.fromEntries(
+			ROUTER_EFFORTS.flatMap(effort =>
+				(base.thresholds[effort] ?? layer.thresholds?.[effort])
+					? [[effort, [...(layer.thresholds?.[effort] ?? base.thresholds[effort]!)] as readonly string[]]]
+					: [],
+			),
+		) as RouterThresholds,
 		classifierModels: layer.classifierModels ? [...layer.classifierModels] : [...base.classifierModels],
 		maxEffort: layer.maxEffort ?? base.maxEffort,
 		classifierTimeoutMs: layer.classifierTimeoutMs ?? base.classifierTimeoutMs,
+		classifierMinPromptChars: layer.classifierMinPromptChars ?? base.classifierMinPromptChars,
+		classifierCooldownMs: layer.classifierCooldownMs ?? base.classifierCooldownMs,
+		thinkingProfiles,
 	};
 }
 
@@ -135,10 +229,19 @@ export async function loadRouterConfig(options: LoadRouterConfigOptions = {}): P
 
 	let config: RouterConfig = {
 		enabled: DEFAULT_ROUTER_CONFIG.enabled,
-		thresholds: { ...DEFAULT_ROUTER_CONFIG.thresholds },
+		thresholds: Object.fromEntries(
+			ROUTER_EFFORTS.flatMap(effort =>
+				DEFAULT_ROUTER_CONFIG.thresholds[effort]
+					? [[effort, [...DEFAULT_ROUTER_CONFIG.thresholds[effort]!]]]
+					: [],
+			),
+		) as RouterThresholds,
 		classifierModels: [...DEFAULT_ROUTER_CONFIG.classifierModels],
 		maxEffort: DEFAULT_ROUTER_CONFIG.maxEffort,
 		classifierTimeoutMs: DEFAULT_ROUTER_CONFIG.classifierTimeoutMs,
+		classifierMinPromptChars: DEFAULT_ROUTER_CONFIG.classifierMinPromptChars,
+		classifierCooldownMs: DEFAULT_ROUTER_CONFIG.classifierCooldownMs,
+		thinkingProfiles: {},
 	};
 	for (const file of files) {
 		config = mergeConfig(config, await readConfigLayer(file));
