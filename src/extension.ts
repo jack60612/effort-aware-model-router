@@ -23,7 +23,7 @@ import {
 	selectThresholdCandidates,
 	type ThinkingEffort,
 } from "./routing";
-import { type RouterSetupContext, runRouterSetup } from "./setup";
+import { BUILTIN_MODEL_ROLE_SELECTORS, type RouterSetupContext, runRouterSetup } from "./setup";
 import {
 	armOneShotSelector,
 	consumeOneShotSelector,
@@ -56,7 +56,7 @@ const ROUTE_COMMAND_COMPLETIONS = [
 ];
 
 function configuredRouteSelectors(config: RouterConfig): string[] {
-	const selectors = new Set(config.classifierModels);
+	const selectors = new Set([...BUILTIN_MODEL_ROLE_SELECTORS, ...config.classifierModels]);
 	for (const candidates of Object.values(config.thresholds)) {
 		for (const selector of candidates ?? []) selectors.add(selector);
 	}

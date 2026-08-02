@@ -186,6 +186,9 @@ describe("runRouterSetup", () => {
 		expect(ui.inputTitles).toEqual(["Skip prompts shorter than this many characters"]);
 		expect(ui.selectTitles).toContain("Wait between automatic classifications");
 		expect(ui.selectOptions.flat()).not.toContain("custom selector");
+		const lowOptions = ui.selectOptions[ui.selectTitles.indexOf("low threshold candidate")] ?? [];
+		expect(lowOptions).toContain("@slow");
+		expect(lowOptions).toContain("@default");
 		expect(ui.inputTitles.some(title => title.toLowerCase().includes("model"))).toBe(false);
 	});
 	it("preserves a non-preset cooldown with a human-readable current option", async () => {

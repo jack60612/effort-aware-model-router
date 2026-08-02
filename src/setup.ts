@@ -73,6 +73,20 @@ function modelSelector(model: RouterSetupModel): string | undefined {
 	const id = model.id.trim();
 	return provider.length > 0 && id.length > 0 ? `${provider}/${id}` : undefined;
 }
+/** OMP's built-in role aliases; the public model query has no role enumeration. */
+export const BUILTIN_MODEL_ROLE_SELECTORS = [
+	"@default",
+	"@smol",
+	"@slow",
+	"@vision",
+	"@plan",
+	"@designer",
+	"@commit",
+	"@tiny",
+	"@task",
+	"@advisor",
+] as const;
+
 interface CooldownChoice {
 	label: string;
 	milliseconds: number;
@@ -256,6 +270,7 @@ export async function runRouterSetup(
 
 	const available = [
 		...new Set([
+			...BUILTIN_MODEL_ROLE_SELECTORS,
 			...config.classifierModels,
 			...context.models
 				.list()
