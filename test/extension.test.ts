@@ -8,8 +8,8 @@ import type {
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent";
 import type { RouteEffort, RouterConfig } from "../src/config";
-import type { RouterSetupContext } from "../src/setup";
 import { createModelRouterExtension } from "../src/extension";
+import type { RouterSetupContext } from "../src/setup";
 import {
 	createRouterState,
 	encodeRouterState,

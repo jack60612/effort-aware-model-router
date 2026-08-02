@@ -2,13 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type RouterConfig, ROUTER_EFFORTS } from "../src/config";
-import {
-	runRouterSetup,
-	writeRouterConfigLayer,
-	type RouterSetupContext,
-	type RouterSetupValues,
-} from "../src/setup";
+import { ROUTER_EFFORTS, type RouterConfig } from "../src/config";
+import { type RouterSetupContext, type RouterSetupValues, runRouterSetup, writeRouterConfigLayer } from "../src/setup";
 
 let root: string;
 let homeDir: string;
@@ -132,27 +127,17 @@ describe("writeRouterConfigLayer", () => {
 describe("runRouterSetup", () => {
 	it("writes a confirmed project setup with ordered candidates and a model profile", async () => {
 		const ui = new FakeUI(
-			[
-				"project",
-				"enabled",
-				"low",
-				"mock/smol",
-				"done",
-				"mock/smol",
-				"low",
-				"medium",
-				"inherit",
-				"done",
-			],
+			["project", "enabled", "low", "mock/smol", "done", "mock/smol", "low", "medium", "inherit", "done"],
 			["4", "500", "@tiny, @smol"],
 			[false, true],
 		);
 		const result = await runRouterSetup(setupContext(ui), config);
 
 		expect(result.status).toBe("written");
-		const written = JSON.parse(
-			await fs.readFile(path.join(cwd, ".omp", "model-router.json"), "utf8"),
-		) as Record<string, unknown>;
+		const written = JSON.parse(await fs.readFile(path.join(cwd, ".omp", "model-router.json"), "utf8")) as Record<
+			string,
+			unknown
+		>;
 		expect(written).toMatchObject({
 			enabled: true,
 			classifierModels: ["@tiny", "@smol"],

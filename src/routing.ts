@@ -46,9 +46,9 @@ export function selectThresholdSelector(classified: RouteEffort, thresholds: unk
 export function resolveThinkingEffort(classified: RouteEffort, profile: unknown): ThinkingEffort {
 	if (typeof profile !== "object" || profile === null || Array.isArray(profile)) return classified;
 	const values = profile as Record<string, unknown>;
-	const exact = values[classified];
+	const exact = Object.hasOwn(values, classified) ? values[classified] : undefined;
 	if (THINKING_EFFORTS.some(effort => effort === exact)) return exact as ThinkingEffort;
-	const fallback = values.default;
+	const fallback = Object.hasOwn(values, "default") ? values.default : undefined;
 	if (THINKING_EFFORTS.some(effort => effort === fallback)) return fallback as ThinkingEffort;
 	return classified;
 }

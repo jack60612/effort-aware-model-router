@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "effort-aware-model-router",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Effort-aware model routing extension for omp",
 	"homepage": "https://omp.sh",
 	"author": "Derek Rynd",

@@ -85,7 +85,7 @@ describe("loadRouterConfig", () => {
 			thinkingProfiles: {},
 		});
 	});
-	
+
 	it("merges candidate lists by effort and profiles by exact model key", async () => {
 		await writeJson(path.join(homeDir, ".omp", "agent", "model-router.json"), {
 			thresholds: { low: ["user/low", "user/fallback"] },
@@ -176,7 +176,7 @@ describe("parseRouterConfigLayer", () => {
 		expect(parseRouterConfigLayer(null)).toEqual({});
 		expect(parseRouterConfigLayer([])).toEqual({});
 	});
-	
+
 	it("normalizes threshold arrays and validates timing and thinking-profile fields", () => {
 		const inheritedProfile = { default: "high" };
 		const profile = Object.create(inheritedProfile) as Record<string, unknown>;
@@ -212,7 +212,7 @@ describe("parseRouterConfigLayer", () => {
 			},
 		});
 	});
-	
+
 	it("ignores invalid timing values and malformed profile roots", () => {
 		expect(
 			parseRouterConfigLayer({

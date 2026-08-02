@@ -5,8 +5,8 @@ import {
 	formatModelSelector,
 	hasContextCapacity,
 	modelsEqual,
-	resolveThinkingEffort,
 	type RoutableModel,
+	resolveThinkingEffort,
 	selectThresholdCandidates,
 	selectThresholdSelector,
 } from "../src/routing";
@@ -91,6 +91,10 @@ describe("resolveThinkingEffort", () => {
 	it("ignores malformed profile values", () => {
 		expect(resolveThinkingEffort("high", { default: "invalid" })).toBe("high");
 		expect(resolveThinkingEffort("high", { default: "minimal" })).toBe("minimal");
+	});
+	it("ignores inherited thinking-profile values", () => {
+		const profile = Object.create({ high: "max" }) as Record<string, unknown>;
+		expect(resolveThinkingEffort("high", profile)).toBe("high");
 	});
 });
 

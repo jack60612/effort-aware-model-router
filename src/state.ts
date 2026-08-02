@@ -139,7 +139,7 @@ function parseDecision(value: unknown, legacy = false): RouterDecision | null | 
 	if (input.outcome === "baseline" && reason === null) return undefined;
 
 	const timestamp = legacy ? 0 : parseTimestamp(input.timestamp);
-	if (timestamp === undefined || timestamp === null && !legacy) return undefined;
+	if (timestamp === undefined || (timestamp === null && !legacy)) return undefined;
 	const candidates = legacy ? (selector ? [selector] : []) : parseCandidates(input.candidates);
 	if (candidates === undefined) return undefined;
 	const attempts = legacy ? [] : parseAttempts(input.attempts);

@@ -34,7 +34,8 @@ The router starts enabled in `auto` mode and stores the session's current model 
 2. Calls that model directly through `@oh-my-pi/pi-ai` and asks for one effort value. It does not send a prompt through the agent session, so classification cannot recursively trigger the extension.
 3. Classifies up to `xhigh` by default, with a 4,000 ms timeout.
 4. Chooses the highest configured threshold at or below the classified effort.
-5. Checks that the selected target has enough context, switches through OMP's public model API, and clamps thinking effort to what the target model supports.
+5. Tries that threshold's ordered candidates. Each candidate must resolve, fit the current context, and authenticate; if one fails, the next candidate is attempted. If all candidates fail, the router returns to the stored baseline.
+6. Applies an exact model-specific thinking profile when configured, then clamps the resulting thinking effort to what the target model supports.
 
 The default thresholds produce:
 
@@ -47,9 +48,11 @@ The default thresholds produce:
 
 `max` is not offered by the default classifier prompt because the default `maxEffort` is `xhigh`. Set `maxEffort` to `max` and add or inherit the thresholds you want if classification should be able to return `max`.
 
-Only the single selected threshold is attempted. If its model cannot be resolved or authenticated, the router returns to the stored baseline; it does not retry a lower threshold. If the target is already current, the router avoids a redundant model switch but still applies a supported thinking level. Non-reasoning models, and models without controllable effort metadata, receive no explicit thinking-level change.
+If `classifierMinPromptChars` is non-zero, prompts shorter than that trimmed character count skip classification. If `classifierCooldownMs` is non-zero, prompts arriving during the cooldown after the last classification also skip classification. Both safeguards are disabled by default.
 
-## Configuration
+If the target is already current, the router avoids a redundant model switch but still applies a supported thinking level. Non-reasoning models, and models without controllable effort metadata, receive no explicit thinking-level change.
+
+The router records the latest decision and a bounded history of the last eight decisions in session state. `/route explain` shows candidate attempts and the selected model; `/route history` shows the compact history.
 
 Configuration is JSON. Layers load in this order, with later valid values overriding earlier ones:
 
@@ -64,40 +67,52 @@ For example, this is the complete built-in configuration:
 {
   "enabled": true,
   "thresholds": {
-    "low": "@smol",
-    "high": "@slow"
+    "low": ["@smol"],
+    "high": ["@slow"]
   },
   "classifierModels": ["@tiny", "@smol"],
   "maxEffort": "xhigh",
-  "classifierTimeoutMs": 4000
+  "classifierTimeoutMs": 4000,
+  "classifierMinPromptChars": 0,
+  "classifierCooldownMs": 0,
+  "thinkingProfiles": {}
 }
 ```
 
 | Field | Type | Behavior |
 | --- | --- | --- |
 | `enabled` | boolean | Seeds new router state as `auto` when `true` and `off` when `false`. Reloading `false` while in `auto` also changes the mode to `off`; reloading `true` does not override an existing manual or off mode. |
-| `thresholds` | object | Maps any of `low`, `medium`, `high`, `xhigh`, or `max` to a non-empty OMP model selector such as `@smol` or `provider/model`. Threshold keys merge across layers, including with the built-in `low` and `high` entries. |
+| `thresholds` | object | Maps any of `low`, `medium`, `high`, `xhigh`, or `max` to one selector string or an ordered non-empty selector array such as `@smol` or `provider/model`. The nearest configured threshold at or below the classified effort supplies the candidates; they are attempted in order. A string is accepted for backwards compatibility and normalized to a one-item array. |
 | `classifierModels` | non-empty string array | Ordered model selectors. The first selector that resolves and has credentials performs the one direct classification call. A valid later layer replaces the entire array. |
 | `maxEffort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Caps the returned classification. The classifier prompt offers `max` only when this field is `max`. |
 | `classifierTimeoutMs` | positive integer | Timeout in milliseconds used for classifier credential lookup and completion. |
+| `classifierMinPromptChars` | non-negative integer | Skips classification for prompts whose trimmed text is shorter than this value. `0` disables the minimum. |
+| `classifierCooldownMs` | non-negative integer | Skips classification until this many milliseconds have elapsed since the last classification attempt. `0` disables the cooldown. |
+| `thinkingProfiles` | object | Maps an exact `provider/model` identity to `default` and/or classified-effort thinking overrides. Exact effort override wins over `default`, which wins over the classified effort; the result is clamped to the target model's supported thinking metadata. |
 
-Unknown fields, unknown threshold names, inherited properties, and invalid field values are ignored. An unreadable file or invalid JSON layer is ignored. Threshold objects merge by valid effort key; omission does not remove a threshold inherited from defaults or an earlier layer.
+Unknown fields, unknown threshold names, inherited properties, and invalid field values are ignored. An unreadable file or invalid JSON layer is ignored. Threshold objects merge by valid effort key; omission does not remove a threshold inherited from defaults or an earlier layer. Thinking profiles merge by exact model key and field.
 
-Use `/route reload` after editing a file in a running session. Configuration is also reloaded during session start, switch, branch, and tree lifecycle events.
+Use `/route setup` for an interactive public-UI wizard that chooses project or user scope, available models or custom selectors, fallback ordering, classifier safeguards, and a model-specific thinking profile. The wizard writes only after final confirmation, preserves unrelated JSON fields, and reports unsupported in headless contexts. Use `/route reload` after editing a file in a running session. Configuration is also reloaded during session start, switch, branch, and tree lifecycle events.
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
 | `/route` or `/route status` | Show the current mode, baseline, and last decision in the status area and a notification. |
+| `/route explain` | Explain the latest decision, including ordered candidates, per-candidate outcomes, selected candidate, thinking profile, and fallback reason. |
+| `/route history` | Show the bounded history of recent routing decisions. |
+| `/route once <selector>` | Resolve and arm one selector for the next eligible prompt. This bypasses auto/manual mode, the classifier minimum, and cooldown once, then consumes itself. |
 | `/route auto` | Enable automatic routing and use the current model as the baseline. On a transition, clears the previous automatic target and decision; repeating it while already automatic on the same baseline is a no-op. |
 | `/route manual` | Reliably pin the current model as both manual target and baseline. |
 | `/route manual <selector>` | Resolve and, if needed, switch to the selector, then pin it as the manual target and baseline. Resolution or authentication failure leaves the prior mode unchanged and warns. |
 | `/route off` | Stop automatic classification and routing. It does not switch models or reset the stored baseline. |
+| `/route setup` | Open the interactive configuration wizard. It uses the public UI API and does not write in headless contexts. |
 | `/route reload` | Reload the layered configuration for the current working directory. |
 | `/model auto` | Exact interactive alias for `/route auto`; the extension consumes it before the built-in `/model` command. |
 
 Other slash commands are not classified. In particular, normal `/model <selector>` commands remain OMP commands rather than router commands.
+
+The setup wizard writes either the project file `<cwd>/.omp/model-router.json` or the user file `~/.omp/agent/model-router.json`, depending on the selected scope. Existing router fields are updated while unrelated top-level fields and unknown nested threshold/profile fields are preserved.
 
 ## Manual model changes and same-model ambiguity
 
@@ -114,12 +129,12 @@ The router attempts to return to the stored baseline when:
 - no configured classifier resolves with credentials;
 - classification errors, aborts, times out, or returns no usable effort;
 - no threshold matches the classified effort;
-- the selected route cannot be resolved or authenticated; or
+- every candidate in the selected threshold fails to resolve, authenticate, or fit the current context; or
 - current context usage is unavailable, or the current context plus estimated prompt does not fit the target model's context window.
 
 Failures are contained: if the stored baseline itself cannot be resolved or authenticated, the router leaves the available current model in place and records the fallback outcome. User notifications and logger warnings are deduplicated by warning key, so the same persisted outcome does not warn on every turn.
 
-Mode, baseline, observed and automatic model identities, the last decision, and warning keys are stored as versioned `model-router-state` custom session entries. The newest valid entry on the active branch is restored across resume and session lifecycle changes; malformed entries are ignored. The footer status reports the mode and baseline before the first decision, then the latest effort, target, and outcome.
+Mode, baseline, observed and automatic model identities, the last decision, one-shot selector state, bounded decision history, and warning keys are stored as version-2 `model-router-state` custom session entries. A version-1 entry is read and upgraded in memory with an empty history and no one-shot selector; malformed entries are ignored. The newest valid entry on the active branch is restored across resume and session lifecycle changes. The footer status reports the mode and baseline before the first decision, then the latest effort, target, and outcome.
 
 ## Compatibility
 

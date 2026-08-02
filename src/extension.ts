@@ -12,7 +12,6 @@ import type {
 	SessionTreeEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import { classifyPromptEffort } from "./classifier";
-import { runRouterSetup, type RouterSetupContext } from "./setup";
 import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, type RouteEffort, type RouterConfig } from "./config";
 import {
 	clampEffortToModel,
@@ -24,6 +23,7 @@ import {
 	selectThresholdCandidates,
 	type ThinkingEffort,
 } from "./routing";
+import { type RouterSetupContext, runRouterSetup } from "./setup";
 import {
 	armOneShotSelector,
 	consumeOneShotSelector,
@@ -33,11 +33,10 @@ import {
 	MODEL_ROUTER_STATE_ENTRY,
 	type ModelIdentity,
 	parseRouterState,
-	recordRouterDecision,
 	type RouterCandidateAttempt,
-	type RouterDecision,
 	type RouterFailureReason,
 	type RouterState,
+	recordRouterDecision,
 } from "./state";
 
 const STATUS_KEY = "model-router";

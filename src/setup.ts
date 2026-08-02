@@ -63,7 +63,6 @@ function configPath(scope: "user" | "project", cwd: string, homeDir: string): st
 		: path.join(cwd, ".omp", "model-router.json");
 }
 
-
 function selectorsFromInput(value: string): string[] | undefined {
 	const selectors = value
 		.split(/[\n,]/u)
@@ -116,9 +115,7 @@ export async function writeRouterConfigLayer(
 	}
 
 	const existingThresholds =
-		typeof existing.thresholds === "object" &&
-		existing.thresholds !== null &&
-		!Array.isArray(existing.thresholds)
+		typeof existing.thresholds === "object" && existing.thresholds !== null && !Array.isArray(existing.thresholds)
 			? (existing.thresholds as Record<string, unknown>)
 			: {};
 	const existingProfiles =
@@ -162,7 +159,11 @@ async function selectThresholdCandidates(
 ): Promise<string[] | undefined | null> {
 	const candidates: string[] = [];
 	while (true) {
-		const selected = await context.ui.select(`${effort} threshold candidate`, [...available, "custom selector", "done"]);
+		const selected = await context.ui.select(`${effort} threshold candidate`, [
+			...available,
+			"custom selector",
+			"done",
+		]);
 		if (selected === undefined) return null;
 		if (selected === "done") break;
 		if (selected === "custom selector") {
@@ -245,18 +246,35 @@ export async function runRouterSetup(
 		return { status: "error", error: new Error("invalid classifier selectors") };
 	}
 
-	const available = [...new Set(context.models.list().map(modelSelector).filter((selector): selector is string => selector !== undefined))];
+	const available = [
+		...new Set(
+			context.models
+				.list()
+				.map(modelSelector)
+				.filter((selector): selector is string => selector !== undefined),
+		),
+	];
 	const thresholds = cloneThresholds(config.thresholds);
 	while (true) {
-		const currentSummary = ROUTER_EFFORTS.map(effort => `${effort}=${thresholds[effort]?.join(" → ") ?? "unset"}`).join(", ");
-		const effort = await context.ui.select(`Choose a threshold to configure (${currentSummary})`, ["done", ...ROUTER_EFFORTS]);
+		const currentSummary = ROUTER_EFFORTS.map(
+			effort => `${effort}=${thresholds[effort]?.join(" → ") ?? "unset"}`,
+		).join(", ");
+		const effort = await context.ui.select(`Choose a threshold to configure (${currentSummary})`, [
+			"done",
+			...ROUTER_EFFORTS,
+		]);
 		if (effort === undefined) return { status: "cancelled" };
 		if (effort === "done") break;
 		if (!ROUTER_EFFORTS.some(candidate => candidate === effort)) {
 			return { status: "error", error: new Error("invalid threshold choice") };
 		}
 		const selectedEffort = effort as RouteEffort;
-		const candidates = await selectThresholdCandidates(context, selectedEffort, thresholds[selectedEffort], available);
+		const candidates = await selectThresholdCandidates(
+			context,
+			selectedEffort,
+			thresholds[selectedEffort],
+			available,
+		);
 		if (candidates === null) return { status: "cancelled" };
 		if (candidates === undefined && thresholds[selectedEffort] === undefined) {
 			notify(context, `No candidates configured for the ${selectedEffort} threshold`, "warning");
@@ -265,7 +283,11 @@ export async function runRouterSetup(
 		if (candidates !== undefined) thresholds[selectedEffort] = candidates;
 	}
 
-	const profileChoice = await context.ui.select("Optional model-specific thinking profile", ["none", ...available, "custom selector"]);
+	const profileChoice = await context.ui.select("Optional model-specific thinking profile", [
+		"none",
+		...available,
+		"custom selector",
+	]);
 	if (profileChoice === undefined) return { status: "cancelled" };
 	const thinkingProfiles = cloneProfiles(config.thinkingProfiles);
 	if (profileChoice !== "none") {
@@ -286,7 +308,11 @@ export async function runRouterSetup(
 		}
 		profile.default = defaultEffort as RouterThinkingEffort;
 		for (const override of ["xhigh", "max"] as const) {
-			const selected = await context.ui.select(`${override} thinking override`, ["inherit", "minimal", ...ROUTER_EFFORTS]);
+			const selected = await context.ui.select(`${override} thinking override`, [
+				"inherit",
+				"minimal",
+				...ROUTER_EFFORTS,
+			]);
 			if (selected === undefined) return { status: "cancelled" };
 			if (selected !== "inherit") {
 				if (!(["minimal", ...ROUTER_EFFORTS] as string[]).includes(selected)) {

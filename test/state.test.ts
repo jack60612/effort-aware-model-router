@@ -1,16 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import {
 	armOneShotSelector,
+	consumeOneShotSelector,
 	createRouterState,
 	encodeRouterState,
 	MODEL_ROUTER_HISTORY_LIMIT,
 	MODEL_ROUTER_STATE_ENTRY,
 	parseRouterState,
-	recordRouterDecision,
 	type RouterDecision,
 	type RouterState,
+	recordRouterDecision,
 	restoreRouterState,
-	consumeOneShotSelector,
 } from "../src/state";
 
 const base = { provider: "mock", id: "base" } as const;

@@ -8,9 +8,7 @@ export type RouteEffort = (typeof ROUTER_EFFORTS)[number];
 export type RouterThinkingEffort = "minimal" | RouteEffort;
 export type RouterThresholdInput = string | readonly string[];
 export type RouterThresholds = Partial<Record<RouteEffort, readonly string[]>>;
-export type RouterThinkingProfile = Partial<
-	Record<"default" | RouteEffort, RouterThinkingEffort>
->;
+export type RouterThinkingProfile = Partial<Record<"default" | RouteEffort, RouterThinkingEffort>>;
 export type RouterThinkingProfiles = Record<string, RouterThinkingProfile>;
 
 export interface RouterConfig {
@@ -231,9 +229,7 @@ export async function loadRouterConfig(options: LoadRouterConfigOptions = {}): P
 		enabled: DEFAULT_ROUTER_CONFIG.enabled,
 		thresholds: Object.fromEntries(
 			ROUTER_EFFORTS.flatMap(effort =>
-				DEFAULT_ROUTER_CONFIG.thresholds[effort]
-					? [[effort, [...DEFAULT_ROUTER_CONFIG.thresholds[effort]!]]]
-					: [],
+				DEFAULT_ROUTER_CONFIG.thresholds[effort] ? [[effort, [...DEFAULT_ROUTER_CONFIG.thresholds[effort]!]]] : [],
 			),
 		) as RouterThresholds,
 		classifierModels: [...DEFAULT_ROUTER_CONFIG.classifierModels],
