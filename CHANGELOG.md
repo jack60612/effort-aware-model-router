@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Updated `/route setup` to use selectable model boxes instead of freeform model entry and replaced the raw cooldown-milliseconds field with human-readable timing presets.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added

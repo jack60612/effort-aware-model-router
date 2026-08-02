@@ -92,7 +92,7 @@ For example, this is the complete built-in configuration:
 
 Unknown fields, unknown threshold names, inherited properties, and invalid field values are ignored. An unreadable file or invalid JSON layer is ignored. Threshold objects merge by valid effort key; omission does not remove a threshold inherited from defaults or an earlier layer. Thinking profiles merge by exact model key and field.
 
-Use `/route setup` for an interactive public-UI wizard that chooses project or user scope, available models or custom selectors, fallback ordering, classifier safeguards, and a model-specific thinking profile. The wizard writes only after final confirmation, preserves unrelated JSON fields, and reports unsupported in headless contexts. Use `/route reload` after editing a file in a running session. Configuration is also reloaded during session start, switch, branch, and tree lifecycle events.
+Use `/route setup` for an interactive public-UI wizard that chooses project or user scope, selectable model boxes (including currently configured selectors), fallback ordering, classifier safeguards with human-readable cooldown choices, and a model-specific thinking profile. The wizard does not accept freeform model input; manual JSON remains supported. It writes only after final confirmation, preserves unrelated JSON fields, and reports unsupported in headless contexts. Use `/route reload` after editing a file in a running session. Configuration is also reloaded during session start, switch, branch, and tree lifecycle events.
 
 ## Commands
 

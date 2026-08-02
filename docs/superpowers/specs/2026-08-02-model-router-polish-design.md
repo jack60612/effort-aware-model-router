@@ -85,13 +85,13 @@ No candidate retry changes the classifier effort or silently lowers the threshol
 `/route setup` opens a built-in OMP dialog flow rather than a custom private component. The wizard:
 
 1. Lets the user choose user-level or project-level configuration.
-2. Shows enablement and classifier settings with current values.
-3. Offers available resolved models plus a custom-selector input for each threshold candidate.
+2. Shows enablement and classifier settings with current values, including human-readable cooldown presets.
+3. Uses selectable model boxes for available resolved models and currently configured selectors when choosing classifier, threshold, or profile models; it does not accept freeform model entry.
 4. Lets the user add ordered fallback candidates.
 5. Lets the user configure a model-specific thinking profile with a default effort and optional `xhigh`/`max` overrides.
 6. Displays a final summary and requires confirmation before writing JSON.
 
-The wizard writes only the selected config layer, preserves unknown fields in that file, reloads the validated result, and reports the exact path written. If the UI surface is unavailable (RPC, ACP, print, or a headless test context), `/route setup` returns a clear unsupported-surface message without writing anything. Existing slash commands and manual JSON configuration remain supported.
+The wizard writes only the selected config layer, preserves unknown fields in that file, reloads the validated result, and reports the exact path written. If the UI surface is unavailable (RPC, ACP, print, or a headless test context), `/route setup` returns a clear unsupported-surface message without writing anything. New custom selectors remain available through manual JSON configuration.
 
 ## State and compatibility
 

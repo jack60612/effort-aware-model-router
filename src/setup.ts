@@ -63,14 +63,6 @@ function configPath(scope: "user" | "project", cwd: string, homeDir: string): st
 		: path.join(cwd, ".omp", "model-router.json");
 }
 
-function selectorsFromInput(value: string): string[] | undefined {
-	const selectors = value
-		.split(/[\n,]/u)
-		.map(selector => selector.trim())
-		.filter(selector => selector.length > 0);
-	return selectors.length > 0 ? selectors : undefined;
-}
-
 function parseNonNegativeInteger(value: string): number | undefined {
 	const parsed = Number(value.trim());
 	return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
@@ -80,6 +72,68 @@ function modelSelector(model: RouterSetupModel): string | undefined {
 	const provider = model.provider.trim();
 	const id = model.id.trim();
 	return provider.length > 0 && id.length > 0 ? `${provider}/${id}` : undefined;
+}
+interface CooldownChoice {
+	label: string;
+	milliseconds: number;
+}
+
+const COOLDOWN_CHOICES: readonly CooldownChoice[] = [
+	{ label: "No wait — classify every eligible prompt", milliseconds: 0 },
+	{ label: "1 second — wait after each classification", milliseconds: 1_000 },
+	{ label: "5 seconds — wait after each classification", milliseconds: 5_000 },
+	{ label: "30 seconds — wait after each classification", milliseconds: 30_000 },
+	{ label: "1 minute — wait after each classification", milliseconds: 60_000 },
+	{ label: "5 minutes — wait after each classification", milliseconds: 300_000 },
+];
+
+function formatCooldown(milliseconds: number): string {
+	if (milliseconds === 0) return "no wait";
+	if (milliseconds % 60_000 === 0) {
+		const minutes = milliseconds / 60_000;
+		return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+	}
+	if (milliseconds % 1_000 === 0) {
+		const seconds = milliseconds / 1_000;
+		return `${seconds} second${seconds === 1 ? "" : "s"}`;
+	}
+	return `${milliseconds} milliseconds`;
+}
+
+function cooldownChoices(current: number): CooldownChoice[] {
+	if (COOLDOWN_CHOICES.some(choice => choice.milliseconds === current)) return [...COOLDOWN_CHOICES];
+	return [{ label: `Keep current — ${formatCooldown(current)}`, milliseconds: current }, ...COOLDOWN_CHOICES];
+}
+
+async function selectOrderedModels(
+	context: RouterSetupContext,
+	title: string,
+	current: readonly string[] | undefined,
+	available: readonly string[],
+): Promise<string[] | undefined | null> {
+	const remaining = [...new Set([...(current ?? []), ...available])];
+	const selected: string[] = [];
+	while (true) {
+		const choice = await context.ui.select(title, [...remaining, "done"]);
+		if (choice === undefined) return null;
+		if (choice === "done") return selected.length > 0 ? selected : current ? [...current] : undefined;
+		if (!remaining.includes(choice)) return undefined;
+		selected.push(choice);
+		remaining.splice(remaining.indexOf(choice), 1);
+		if (remaining.length === 0) return selected;
+		if (!(await context.ui.confirm(`Add another ${title.toLowerCase()}?`, "Selections are tried in this order."))) {
+			return selected;
+		}
+	}
+}
+
+async function selectThresholdCandidates(
+	context: RouterSetupContext,
+	effort: RouteEffort,
+	current: readonly string[] | undefined,
+	available: readonly string[],
+): Promise<string[] | undefined | null> {
+	return selectOrderedModels(context, `${effort} threshold candidate`, current, available);
 }
 
 function cloneThresholds(thresholds: RouterThresholds): RouterThresholds {
@@ -151,41 +205,6 @@ function notify(context: RouterSetupContext, message: string, type: "info" | "wa
 	context.ui.notify?.(message, type);
 }
 
-async function selectThresholdCandidates(
-	context: RouterSetupContext,
-	effort: RouteEffort,
-	current: readonly string[] | undefined,
-	available: readonly string[],
-): Promise<string[] | undefined | null> {
-	const candidates: string[] = [];
-	while (true) {
-		const selected = await context.ui.select(`${effort} threshold candidate`, [
-			...available,
-			"custom selector",
-			"done",
-		]);
-		if (selected === undefined) return null;
-		if (selected === "done") break;
-		if (selected === "custom selector") {
-			const custom = await context.ui.input(
-				`Custom ${effort} selector(s)`,
-				current?.join(", ") ?? "provider/model, fallback/provider-model",
-			);
-			if (custom === undefined) return null;
-			const parsed = selectorsFromInput(custom);
-			if (!parsed) {
-				notify(context, `No valid selectors were entered for the ${effort} threshold`, "warning");
-				return undefined;
-			}
-			candidates.push(...parsed);
-		} else {
-			candidates.push(selected);
-		}
-		if (!(await context.ui.confirm(`Add another ${effort} candidate?`, "Candidates are tried in this order."))) break;
-	}
-	return candidates.length > 0 ? candidates : undefined;
-}
-
 /** Run the public-dialog setup flow and write only after final confirmation. */
 export async function runRouterSetup(
 	context: RouterSetupContext,
@@ -214,7 +233,7 @@ export async function runRouterSetup(
 	}
 
 	const minimumInput = await context.ui.input(
-		"Minimum prompt length before classification",
+		"Skip prompts shorter than this many characters",
 		String(config.classifierMinPromptChars),
 	);
 	if (minimumInput === undefined) return { status: "cancelled" };
@@ -224,27 +243,15 @@ export async function runRouterSetup(
 		return { status: "error", error: new Error("invalid minimum prompt length") };
 	}
 
-	const cooldownInput = await context.ui.input(
-		"Classifier cooldown in milliseconds",
-		String(config.classifierCooldownMs),
+	const cooldownSelection = cooldownChoices(config.classifierCooldownMs);
+	const cooldownChoice = await context.ui.select(
+		"Wait between automatic classifications",
+		cooldownSelection.map(choice => choice.label),
 	);
-	if (cooldownInput === undefined) return { status: "cancelled" };
-	const classifierCooldownMs = parseNonNegativeInteger(cooldownInput);
-	if (classifierCooldownMs === undefined) {
-		notify(context, "Classifier cooldown must be a non-negative safe integer", "warning");
-		return { status: "error", error: new Error("invalid classifier cooldown") };
-	}
-
-	const classifierInput = await context.ui.input(
-		"Classifier model selectors (comma-separated, in priority order)",
-		config.classifierModels.join(", "),
-	);
-	if (classifierInput === undefined) return { status: "cancelled" };
-	const classifierModels = selectorsFromInput(classifierInput);
-	if (!classifierModels) {
-		notify(context, "At least one classifier selector is required", "warning");
-		return { status: "error", error: new Error("invalid classifier selectors") };
-	}
+	if (cooldownChoice === undefined) return { status: "cancelled" };
+	const selectedCooldown = cooldownSelection.find(choice => choice.label === cooldownChoice);
+	if (!selectedCooldown) return { status: "error", error: new Error("invalid cooldown choice") };
+	const classifierCooldownMs = selectedCooldown.milliseconds;
 
 	const available = [
 		...new Set(
@@ -254,6 +261,19 @@ export async function runRouterSetup(
 				.filter((selector): selector is string => selector !== undefined),
 		),
 	];
+	const selectedClassifierModels = await selectOrderedModels(
+		context,
+		"Classifier model candidate",
+		config.classifierModels,
+		available,
+	);
+	if (selectedClassifierModels === null) return { status: "cancelled" };
+	const classifierModels = selectedClassifierModels ?? [...config.classifierModels];
+	if (classifierModels.length === 0) {
+		notify(context, "At least one classifier model must be selected", "warning");
+		return { status: "error", error: new Error("invalid classifier selectors") };
+	}
+
 	const thresholds = cloneThresholds(config.thresholds);
 	while (true) {
 		const currentSummary = ROUTER_EFFORTS.map(
@@ -283,20 +303,15 @@ export async function runRouterSetup(
 		if (candidates !== undefined) thresholds[selectedEffort] = candidates;
 	}
 
+	const profileOptions = [...new Set([...available, ...Object.keys(config.thinkingProfiles)])];
 	const profileChoice = await context.ui.select("Optional model-specific thinking profile", [
 		"none",
-		...available,
-		"custom selector",
+		...profileOptions,
 	]);
 	if (profileChoice === undefined) return { status: "cancelled" };
 	const thinkingProfiles = cloneProfiles(config.thinkingProfiles);
 	if (profileChoice !== "none") {
-		const profileModel =
-			profileChoice === "custom selector"
-				? await context.ui.input("Model identity for thinking profile", "provider/model")
-				: profileChoice;
-		if (profileModel === undefined) return { status: "cancelled" };
-		const normalizedModel = profileModel.trim();
+		const normalizedModel = profileChoice.trim();
 		if (normalizedModel.length === 0) {
 			return { status: "error", error: new Error("invalid thinking profile model") };
 		}

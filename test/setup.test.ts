@@ -37,6 +37,9 @@ class FakeUI {
 	readonly entered: string[] = [];
 	readonly confirmed: boolean[] = [];
 	readonly notifications: string[] = [];
+	readonly selectTitles: string[] = [];
+	readonly selectOptions: string[][] = [];
+	readonly inputTitles: string[] = [];
 
 	constructor(
 		private readonly selections: Array<string | undefined>,
@@ -44,11 +47,14 @@ class FakeUI {
 		private readonly confirmations: boolean[] = [],
 	) {}
 
-	async select(): Promise<string | undefined> {
+	async select(title: string, options: string[]): Promise<string | undefined> {
+		this.selectTitles.push(title);
+		this.selectOptions.push(options);
 		return this.selections.shift();
 	}
 
-	async input(): Promise<string | undefined> {
+	async input(title: string): Promise<string | undefined> {
+		this.inputTitles.push(title);
 		return this.inputs.shift();
 	}
 
@@ -127,9 +133,22 @@ describe("writeRouterConfigLayer", () => {
 describe("runRouterSetup", () => {
 	it("writes a confirmed project setup with ordered candidates and a model profile", async () => {
 		const ui = new FakeUI(
-			["project", "enabled", "low", "mock/smol", "done", "mock/smol", "low", "medium", "inherit", "done"],
-			["4", "500", "@tiny, @smol"],
-			[false, true],
+			[
+				"project",
+				"enabled",
+				"5 seconds — wait after each classification",
+				"@tiny",
+				"@smol",
+				"low",
+				"mock/smol",
+				"done",
+				"mock/smol",
+				"low",
+				"medium",
+				"inherit",
+			],
+			["4"],
+			[true, false, false, true],
 		);
 		const result = await runRouterSetup(setupContext(ui), config);
 
@@ -142,10 +161,14 @@ describe("runRouterSetup", () => {
 			enabled: true,
 			classifierModels: ["@tiny", "@smol"],
 			classifierMinPromptChars: 4,
-			classifierCooldownMs: 500,
+			classifierCooldownMs: 5_000,
 			thresholds: { low: ["mock/smol"], high: ["@slow"] },
 			thinkingProfiles: { "mock/smol": { default: "low", xhigh: "medium" } },
 		});
+		expect(ui.inputTitles).toEqual(["Skip prompts shorter than this many characters"]);
+		expect(ui.selectTitles).toContain("Wait between automatic classifications");
+		expect(ui.selectOptions.flat()).not.toContain("custom selector");
+		expect(ui.inputTitles.some(title => title.toLowerCase().includes("model"))).toBe(false);
 	});
 
 	it("does not write when cancelled or when the UI surface is unavailable", async () => {
@@ -163,7 +186,11 @@ describe("runRouterSetup", () => {
 		await fs.mkdir(path.dirname(file), { recursive: true });
 		const original = JSON.stringify({ keep: "yes" });
 		await fs.writeFile(file, original);
-		const ui = new FakeUI(["project", "enabled"], ["0", "0", "@tiny"], [false]);
+		const ui = new FakeUI(
+			["project", "enabled", "No wait — classify every eligible prompt", "@tiny", "done", "none"],
+			["0"],
+			[false, false],
+		);
 
 		const result = await runRouterSetup(setupContext(ui), config);
 
