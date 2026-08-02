@@ -15,18 +15,42 @@ export interface RoutableModel {
 
 const THINKING_EFFORTS: readonly ThinkingEffort[] = ["minimal", ...ROUTER_EFFORTS];
 
-/** Select exactly one route: the greatest configured threshold not above the classified effort. */
-export function selectThresholdSelector(classified: RouteEffort, thresholds: unknown): string | undefined {
-	if (typeof thresholds !== "object" || thresholds === null || Array.isArray(thresholds)) return undefined;
+/** Select the nearest configured threshold and preserve its ordered candidates. */
+export function selectThresholdCandidates(classified: RouteEffort, thresholds: unknown): string[] {
+	if (typeof thresholds !== "object" || thresholds === null || Array.isArray(thresholds)) return [];
 	const values = thresholds as Record<string, unknown>;
 	const classifiedIndex = ROUTER_EFFORTS.indexOf(classified);
 	for (let index = classifiedIndex; index >= 0; index -= 1) {
 		const effort = ROUTER_EFFORTS[index];
 		if (!Object.hasOwn(values, effort)) continue;
-		const selector = values[effort];
-		if (typeof selector === "string" && selector.trim().length > 0) return selector.trim();
+		const value = values[effort];
+		const rawCandidates = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
+		const candidates: string[] = [];
+		for (let candidateIndex = 0; candidateIndex < rawCandidates.length; candidateIndex += 1) {
+			if (!Object.hasOwn(rawCandidates, candidateIndex)) continue;
+			const candidate = rawCandidates[candidateIndex];
+			if (typeof candidate !== "string" || candidate.trim().length === 0) continue;
+			candidates.push(candidate.trim());
+		}
+		if (candidates.length > 0) return candidates;
 	}
-	return undefined;
+	return [];
+}
+
+/** Preserve the legacy single-selector view of threshold selection. */
+export function selectThresholdSelector(classified: RouteEffort, thresholds: unknown): string | undefined {
+	return selectThresholdCandidates(classified, thresholds)[0];
+}
+
+/** Resolve a model-specific thinking profile before model metadata clamping. */
+export function resolveThinkingEffort(classified: RouteEffort, profile: unknown): ThinkingEffort {
+	if (typeof profile !== "object" || profile === null || Array.isArray(profile)) return classified;
+	const values = profile as Record<string, unknown>;
+	const exact = values[classified];
+	if (THINKING_EFFORTS.some(effort => effort === exact)) return exact as ThinkingEffort;
+	const fallback = values.default;
+	if (THINKING_EFFORTS.some(effort => effort === fallback)) return fallback as ThinkingEffort;
+	return classified;
 }
 
 /** Format the selector understood by OMP's public model resolver. */
@@ -45,7 +69,7 @@ export function modelsEqual(
 
 /** Clamp a classified effort to the target model's explicit controllable effort surface. */
 export function clampEffortToModel(
-	requested: RouteEffort,
+	requested: ThinkingEffort,
 	model: RoutableModel | undefined,
 ): ThinkingEffort | undefined {
 	if (model?.reasoning !== true || !Array.isArray(model.thinking?.efforts)) return undefined;

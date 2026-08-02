@@ -5,7 +5,9 @@ import {
 	formatModelSelector,
 	hasContextCapacity,
 	modelsEqual,
+	resolveThinkingEffort,
 	type RoutableModel,
+	selectThresholdCandidates,
 	selectThresholdSelector,
 } from "../src/routing";
 
@@ -52,6 +54,43 @@ describe("selectThresholdSelector", () => {
 
 		expect(selectThresholdSelector("medium", configured)).toBeUndefined();
 		expect(selectThresholdSelector("max", configured)).toBe("own/high");
+	});
+});
+
+describe("selectThresholdCandidates", () => {
+	it("returns the ordered candidates from the nearest configured threshold", () => {
+		const thresholds = {
+			low: ["model/low", "model/low-fallback"],
+			high: ["model/high"],
+			xhigh: ["model/xhigh", "model/xhigh-fallback"],
+		};
+
+		expect(selectThresholdCandidates("medium", thresholds)).toEqual(["model/low", "model/low-fallback"]);
+		expect(selectThresholdCandidates("xhigh", thresholds)).toEqual(["model/xhigh", "model/xhigh-fallback"]);
+		expect(selectThresholdCandidates("max", thresholds)).toEqual(["model/xhigh", "model/xhigh-fallback"]);
+	});
+
+	it("accepts legacy strings and ignores inherited or malformed candidates", () => {
+		const configured = Object.create({ low: ["inherited/low"] }) as Record<string, unknown>;
+		configured.medium = ["", 12, "own/medium"];
+		configured.high = "own/high";
+
+		expect(selectThresholdCandidates("medium", configured)).toEqual(["own/medium"]);
+		expect(selectThresholdCandidates("max", configured)).toEqual(["own/high"]);
+		expect(selectThresholdCandidates("low", configured)).toEqual([]);
+	});
+});
+
+describe("resolveThinkingEffort", () => {
+	it("prefers an exact effort override, then the profile default, then classification", () => {
+		expect(resolveThinkingEffort("xhigh", { default: "low", xhigh: "medium" })).toBe("medium");
+		expect(resolveThinkingEffort("high", { default: "low", xhigh: "medium" })).toBe("low");
+		expect(resolveThinkingEffort("high", undefined)).toBe("high");
+	});
+
+	it("ignores malformed profile values", () => {
+		expect(resolveThinkingEffort("high", { default: "invalid" })).toBe("high");
+		expect(resolveThinkingEffort("high", { default: "minimal" })).toBe("minimal");
 	});
 });
 
