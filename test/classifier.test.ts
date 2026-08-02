@@ -52,7 +52,8 @@ describe("classifyPromptEffort", () => {
 			options: SimpleStreamOptions;
 		}> = [];
 		const apiKeyResolver: ApiKeyResolver = () => "smol-key";
-		const timeoutSignal = new AbortController().signal;
+		const timeoutSignals = [new AbortController().signal, new AbortController().signal];
+		const timeoutRequests: number[] = [];
 		const ctx: ClassifierContext = {
 			models: {
 				resolve(selector) {
@@ -81,16 +82,17 @@ describe("classifyPromptEffort", () => {
 			complete,
 			now: () => 987,
 			timeoutSignal: ms => {
-				expect(ms).toBe(4_000);
-				return timeoutSignal;
+				timeoutRequests.push(ms);
+				return timeoutSignals[timeoutRequests.length - 1];
 			},
 		});
 
 		expect(effort).toBe("high");
 		expect(resolvedSelectors).toEqual(["@tiny", "@smol"]);
+		expect(timeoutRequests).toEqual([4_000, 4_000]);
 		expect(keyChecks).toEqual([
-			{ model: tiny, sessionId: "session-42", signal: timeoutSignal },
-			{ model: smol, sessionId: "session-42", signal: timeoutSignal },
+			{ model: tiny, sessionId: "session-42", signal: timeoutSignals[0] },
+			{ model: smol, sessionId: "session-42", signal: timeoutSignals[1] },
 		]);
 		expect(resolverCalls).toEqual([{ model: smol, sessionId: "session-42" }]);
 		expect(completionCalls).toHaveLength(1);
@@ -104,7 +106,7 @@ describe("classifyPromptEffort", () => {
 				apiKey: apiKeyResolver,
 				disableReasoning: true,
 				maxTokens: CLASSIFIER_MAX_TOKENS,
-				signal: timeoutSignal,
+				signal: timeoutSignals[1],
 			},
 		});
 	});
@@ -185,8 +187,56 @@ describe("classifyPromptEffort", () => {
 		expect(effort).toBe("medium");
 	});
 
-	it("propagates provider rejection and rejects provider error responses", async () => {
+	it("falls back to the next candidate when the first completion throws", async () => {
+		const tiny = classifierModel("tiny");
+		const smol = classifierModel("smol");
+		const attempts: Model[] = [];
+		const ctx: ClassifierContext = {
+			models: { resolve: selector => (selector === "@tiny" ? tiny : smol) },
+			modelRegistry: {
+				getApiKey: async () => "key",
+				resolver: () => (() => "key") as ApiKeyResolver,
+			},
+		};
+
+		const effort = await classifyPromptEffort("task", baseConfig, ctx, {
+			complete: async model => {
+				attempts.push(model);
+				if (model === tiny) throw new Error("provider unavailable");
+				return response("medium");
+			},
+		});
+
+		expect(effort).toBe("medium");
+		expect(attempts).toEqual([tiny, smol]);
+	});
+
+	it("falls back past aborted and unparseable first-candidate responses", async () => {
+		const tiny = classifierModel("tiny");
+		const smol = classifierModel("smol");
+		const ctx: ClassifierContext = {
+			models: { resolve: selector => (selector === "@tiny" ? tiny : smol) },
+			modelRegistry: {
+				getApiKey: async () => "key",
+				resolver: () => (() => "key") as ApiKeyResolver,
+			},
+		};
+
+		await expect(
+			classifyPromptEffort("first", baseConfig, ctx, {
+				complete: async model => (model === tiny ? response("", { stopReason: "aborted" }) : response("low")),
+			}),
+		).resolves.toBe("low");
+		await expect(
+			classifyPromptEffort("second", baseConfig, ctx, {
+				complete: async model => (model === tiny ? response("I cannot decide") : response("high")),
+			}),
+		).resolves.toBe("high");
+	});
+
+	it("rejects with a useful error retaining the final failure when every candidate fails", async () => {
 		const selected = classifierModel("selected");
+		const attempts: string[] = [];
 		const ctx: ClassifierContext = {
 			models: { resolve: () => selected },
 			modelRegistry: {
@@ -196,18 +246,38 @@ describe("classifyPromptEffort", () => {
 		};
 		const providerFailure = new Error("provider unavailable");
 
-		await expect(
-			classifyPromptEffort("first", baseConfig, ctx, {
-				complete: async () => {
-					throw providerFailure;
-				},
-			}),
-		).rejects.toBe(providerFailure);
+		const failure = await classifyPromptEffort("first", baseConfig, ctx, {
+			complete: async () => {
+				attempts.push("throw");
+				throw providerFailure;
+			},
+		}).then(
+			() => {
+				throw new Error("expected classification to reject");
+			},
+			(error: unknown) => error as Error,
+		);
+
+		expect(attempts).toEqual(["throw", "throw"]);
+		expect(failure.message).toContain("all classifier candidates failed (@tiny, @smol)");
+		expect(failure.message).toContain("provider unavailable");
+		expect(failure.cause).toBe(providerFailure);
+
 		await expect(
 			classifyPromptEffort("second", baseConfig, ctx, {
 				complete: async () => response("", { stopReason: "error", errorMessage: "quota exceeded" }),
 			}),
 		).rejects.toThrow("quota exceeded");
+		await expect(
+			classifyPromptEffort("third", baseConfig, ctx, {
+				complete: async () => response("", { stopReason: "aborted" }),
+			}),
+		).rejects.toThrow("classifier aborted");
+		await expect(
+			classifyPromptEffort("fourth", baseConfig, ctx, {
+				complete: async () => response("I cannot decide"),
+			}),
+		).rejects.toThrow("unparseable classifier output");
 	});
 
 	it("fails when no configured selector resolves or has authentication", async () => {
@@ -226,6 +296,15 @@ describe("classifyPromptEffort", () => {
 				resolver: () => (() => "unused") as ApiKeyResolver,
 			},
 		};
+		const keyLookupThrows: ClassifierContext = {
+			models: { resolve: () => unauthenticated },
+			modelRegistry: {
+				getApiKey: async () => {
+					throw new Error("keychain locked");
+				},
+				resolver: () => (() => "unused") as ApiKeyResolver,
+			},
+		};
 
 		await expect(classifyPromptEffort("task", baseConfig, noModels)).rejects.toThrow(
 			"no authenticated classifier model",
@@ -233,14 +312,19 @@ describe("classifyPromptEffort", () => {
 		await expect(classifyPromptEffort("task", baseConfig, noKeys)).rejects.toThrow(
 			"no authenticated classifier model",
 		);
+		await expect(classifyPromptEffort("task", baseConfig, keyLookupThrows)).rejects.toThrow(
+			"no authenticated classifier model",
+		);
 	});
 
-	it("passes a bounded timeout signal and composes caller aborts", async () => {
+	it("composes caller aborts with the candidate timeout and does not retry after caller cancellation", async () => {
 		const selected = classifierModel("selected");
 		const timeoutController = new AbortController();
 		const callerController = new AbortController();
 		callerController.abort(new Error("caller aborted"));
 		const seenSignals: AbortSignal[] = [];
+		let timeoutRequests = 0;
+		let completionAttempts = 0;
 		const ctx: ClassifierContext = {
 			models: { resolve: () => selected },
 			modelRegistry: {
@@ -256,40 +340,51 @@ describe("classifyPromptEffort", () => {
 		await expect(
 			classifyPromptEffort("task", { ...baseConfig, classifierTimeoutMs: 25 }, ctx, {
 				timeoutSignal: ms => {
+					timeoutRequests += 1;
 					expect(ms).toBe(25);
 					return timeoutController.signal;
 				},
 				complete: async (_model, _context, options) => {
+					completionAttempts += 1;
 					if (options.signal) seenSignals.push(options.signal);
 					throw options.signal?.reason;
 				},
 			}),
 		).rejects.toThrow("caller aborted");
+		expect(timeoutRequests).toBe(1);
+		expect(completionAttempts).toBe(1);
 		expect(seenSignals).toHaveLength(2);
 		expect(seenSignals[0]).toBe(seenSignals[1]);
 		expect(seenSignals[0]?.aborted).toBe(true);
 	});
 
-	it("rejects aborted and unparseable completion responses", async () => {
-		const selected = classifierModel("selected");
+	it("gives each candidate a fresh timeout signal so a timed-out candidate does not poison the next", async () => {
+		const tiny = classifierModel("tiny");
+		const smol = classifierModel("smol");
+		const signals = [AbortSignal.abort(new Error("candidate timed out")), new AbortController().signal];
+		const handedSignals: AbortSignal[] = [];
 		const ctx: ClassifierContext = {
-			models: { resolve: () => selected },
+			models: { resolve: selector => (selector === "@tiny" ? tiny : smol) },
 			modelRegistry: {
 				getApiKey: async () => "key",
 				resolver: () => (() => "key") as ApiKeyResolver,
 			},
 		};
 
-		await expect(
-			classifyPromptEffort("first", baseConfig, ctx, {
-				complete: async () => response("", { stopReason: "aborted" }),
-			}),
-		).rejects.toThrow("aborted");
-		await expect(
-			classifyPromptEffort("second", baseConfig, ctx, {
-				complete: async () => response("I cannot decide"),
-			}),
-		).rejects.toThrow("unparseable classifier output");
+		const effort = await classifyPromptEffort("task", baseConfig, ctx, {
+			timeoutSignal: () => signals[handedSignals.length],
+			complete: async (_model, _context, options) => {
+				if (options.signal) handedSignals.push(options.signal);
+				if (options.signal?.aborted) throw options.signal.reason;
+				return response("low");
+			},
+		});
+
+		expect(effort).toBe("low");
+		expect(handedSignals).toHaveLength(2);
+		expect(handedSignals[0]).toBe(signals[0]);
+		expect(handedSignals[1]).toBe(signals[1]);
+		expect(handedSignals[1]?.aborted).toBe(false);
 	});
 });
 

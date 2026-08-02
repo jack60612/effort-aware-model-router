@@ -30,9 +30,9 @@ OMP discovers `src/extension.ts` through the repository package's `omp.extension
 
 The router starts enabled in `auto` mode and stores the session's current model as its baseline. For each supported prompt it:
 
-1. Resolves the first authenticated classifier from `@tiny`, then `@smol`.
-2. Calls that model directly through `@oh-my-pi/pi-ai` and asks for one effort value. It does not send a prompt through the agent session, so classification cannot recursively trigger the extension.
-3. Classifies up to `xhigh` by default, with a 4,000 ms timeout.
+1. Tries the configured classifier selectors in order — `@tiny`, then `@smol` by default. A selector that does not resolve or has no credentials is skipped; a candidate whose completion fails (provider error, aborted response, thrown error, or unparseable output) falls through to the next candidate. Only a caller cancellation stops the fallback chain immediately.
+2. Calls the candidate model directly through `@oh-my-pi/pi-ai` and asks for one effort value. It does not send a prompt through the agent session, so classification cannot recursively trigger the extension.
+3. Classifies up to `xhigh` by default, with a fresh 20,000 ms timeout per candidate, so a timed-out candidate does not consume the next candidate's budget.
 4. Chooses the highest configured threshold at or below the classified effort.
 5. Tries that threshold's ordered candidates. Each candidate must resolve, fit the current context, and authenticate; if one fails, the next candidate is attempted. If all candidates fail, the router returns to the stored baseline.
 6. Applies an exact model-specific thinking profile when configured, then clamps the resulting thinking effort to what the target model supports.
@@ -72,7 +72,7 @@ For example, this is the complete built-in configuration:
   },
   "classifierModels": ["@tiny", "@smol"],
   "maxEffort": "xhigh",
-  "classifierTimeoutMs": 4000,
+  "classifierTimeoutMs": 20000,
   "classifierMinPromptChars": 30,
   "classifierCooldownMs": 30000,
   "thinkingProfiles": {}
@@ -83,9 +83,9 @@ For example, this is the complete built-in configuration:
 | --- | --- | --- |
 | `enabled` | boolean | Seeds new router state as `auto` when `true` and `off` when `false`. Reloading `false` while in `auto` also changes the mode to `off`; reloading `true` does not override an existing manual or off mode. |
 | `thresholds` | object | Maps any of `low`, `medium`, `high`, `xhigh`, or `max` to one selector string or an ordered non-empty selector array such as `@smol` or `provider/model`. The nearest configured threshold at or below the classified effort supplies the candidates; they are attempted in order. A string is accepted for backwards compatibility and normalized to a one-item array. |
-| `classifierModels` | non-empty string array | Ordered model selectors. The first selector that resolves and has credentials performs the one direct classification call. A valid later layer replaces the entire array. |
+| `classifierModels` | non-empty string array | Ordered fallback candidates. Each selector that resolves and has credentials gets its own classification attempt; on completion failure the next candidate is tried. A valid later layer replaces the entire array. |
 | `maxEffort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Caps the returned classification. The classifier prompt offers `max` only when this field is `max`. |
-| `classifierTimeoutMs` | positive integer | Timeout in milliseconds used for classifier credential lookup and completion. |
+| `classifierTimeoutMs` | positive integer | Timeout in milliseconds applied per classifier candidate, covering that candidate's credential lookup and completion. The default is `20000`. |
 | `classifierMinPromptChars` | non-negative integer | Skips classification for prompts whose trimmed text is shorter than this value. The default is `30`; `0` disables the minimum. |
 | `classifierCooldownMs` | non-negative integer | Skips classification until this many milliseconds have elapsed since the last classification attempt. The default is `30000` (30 seconds); `0` disables the cooldown. |
 | `thinkingProfiles` | object | Maps an exact `provider/model` identity to `default` and/or classified-effort thinking overrides. Exact effort override wins over `default`, which wins over the classified effort; the result is clamped to the target model's supported thinking metadata. |

@@ -141,9 +141,11 @@ export function parseClassifierEffort(text: string): RouteEffort | undefined {
 }
 
 /**
- * Classify one prompt with a direct pi-ai call. Resolution and auth probing are
- * ordered; exactly one completion is issued after the first authenticated
- * model is found. Any failure is intentionally exposed for caller fallback.
+ * Classify one prompt with a direct pi-ai call. Configured selectors are
+ * ordered fallback candidates: each one is resolved, authenticated, and given
+ * its own completion attempt under a fresh timeout signal. Resolution and auth
+ * failures skip a candidate; completion, provider, abort, and parse failures
+ * fall through to the next candidate unless the caller has already cancelled.
  */
 export async function classifyPromptEffort(
 	promptText: string,
@@ -151,60 +153,81 @@ export async function classifyPromptEffort(
 	ctx: ClassifierContext,
 	dependencies: Partial<ClassifierDependencies> = {},
 ): Promise<RouteEffort> {
-	const timeoutSignal = (dependencies.timeoutSignal ?? AbortSignal.timeout)(config.classifierTimeoutMs);
-	const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeoutSignal]) : timeoutSignal;
-	let selected: Model | undefined;
+	const createTimeoutSignal = dependencies.timeoutSignal ?? AbortSignal.timeout;
+	const complete = dependencies.complete ?? (completeSimple as ClassifierComplete);
+	const now = dependencies.now ?? Date.now;
+	let attempted = false;
+	let lastFailure: unknown;
 
 	for (const selector of config.classifierModels) {
 		const candidate = ctx.models.resolve(selector);
 		if (!candidate) continue;
-		const key = await ctx.modelRegistry.getApiKey(candidate, ctx.sessionId, { signal });
+
+		const timeoutSignal = createTimeoutSignal(config.classifierTimeoutMs);
+		const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeoutSignal]) : timeoutSignal;
+
+		let key: string | undefined;
+		try {
+			key = await ctx.modelRegistry.getApiKey(candidate, ctx.sessionId, { signal });
+		} catch (failure) {
+			if (ctx.signal?.aborted) throw failure;
+			continue;
+		}
 		if (!key) continue;
-		selected = candidate;
-		break;
+
+		attempted = true;
+		try {
+			const response = await complete(
+				candidate,
+				{
+					systemPrompt: [classifierSystemPrompt(config.maxEffort)],
+					messages: [
+						{
+							role: "user",
+							content: preprocessClassifierInput(promptText),
+							timestamp: now(),
+						},
+					],
+				},
+				{
+					apiKey: ctx.modelRegistry.resolver(candidate, ctx.sessionId),
+					disableReasoning: true,
+					maxTokens: CLASSIFIER_MAX_TOKENS,
+					signal,
+				},
+			);
+
+			if (response.stopReason === "error") {
+				throw new Error(`model-router: classifier provider error: ${response.errorMessage ?? "unknown error"}`);
+			}
+			if (response.stopReason === "aborted") {
+				throw new Error(`model-router: classifier aborted: ${response.errorMessage ?? "request aborted"}`);
+			}
+
+			const text = extractText(response.content);
+			const effort = parseClassifierEffort(text);
+			if (!effort) {
+				throw new Error(`model-router: unparseable classifier output: ${JSON.stringify(text)}`);
+			}
+			const classifiedIndex = ROUTER_EFFORTS.indexOf(effort);
+			const ceilingIndex = ROUTER_EFFORTS.indexOf(config.maxEffort);
+			return classifiedIndex <= ceilingIndex ? effort : config.maxEffort;
+		} catch (failure) {
+			if (ctx.signal?.aborted) throw failure;
+			lastFailure = failure;
+		}
 	}
-	if (!selected) {
+
+	if (!attempted) {
 		throw new Error(
 			`model-router: no authenticated classifier model available (${config.classifierModels.join(", ")})`,
 		);
 	}
-
-	const complete = dependencies.complete ?? (completeSimple as ClassifierComplete);
-	const response = await complete(
-		selected,
-		{
-			systemPrompt: [classifierSystemPrompt(config.maxEffort)],
-			messages: [
-				{
-					role: "user",
-					content: preprocessClassifierInput(promptText),
-					timestamp: (dependencies.now ?? Date.now)(),
-				},
-			],
-		},
-		{
-			apiKey: ctx.modelRegistry.resolver(selected, ctx.sessionId),
-			disableReasoning: true,
-			maxTokens: CLASSIFIER_MAX_TOKENS,
-			signal,
-		},
+	const detail = lastFailure instanceof Error ? lastFailure.message : String(lastFailure);
+	throw new Error(
+		`model-router: all classifier candidates failed (${config.classifierModels.join(", ")}); last failure: ${detail}`,
+		{ cause: lastFailure },
 	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`model-router: classifier provider error: ${response.errorMessage ?? "unknown error"}`);
-	}
-	if (response.stopReason === "aborted") {
-		throw new Error(`model-router: classifier aborted: ${response.errorMessage ?? "request aborted"}`);
-	}
-
-	const text = extractText(response.content);
-	const effort = parseClassifierEffort(text);
-	if (!effort) {
-		throw new Error(`model-router: unparseable classifier output: ${JSON.stringify(text)}`);
-	}
-	const classifiedIndex = ROUTER_EFFORTS.indexOf(effort);
-	const ceilingIndex = ROUTER_EFFORTS.indexOf(config.maxEffort);
-	return classifiedIndex <= ceilingIndex ? effort : config.maxEffort;
 }
 
 function extractText(content: AssistantMessage["content"]): string {
