@@ -35,8 +35,8 @@ describe("loadRouterConfig", () => {
 			classifierModels: ["@tiny", "@smol"],
 			maxEffort: "xhigh",
 			classifierTimeoutMs: 4_000,
-			classifierMinPromptChars: 0,
-			classifierCooldownMs: 0,
+			classifierMinPromptChars: 30,
+			classifierCooldownMs: 30_000,
 			thinkingProfiles: {},
 		});
 		expect(config).not.toBe(DEFAULT_ROUTER_CONFIG);
@@ -80,8 +80,8 @@ describe("loadRouterConfig", () => {
 			classifierModels: ["@tiny"],
 			maxEffort: "max",
 			classifierTimeoutMs: 2_500,
-			classifierMinPromptChars: 0,
-			classifierCooldownMs: 0,
+			classifierMinPromptChars: 30,
+			classifierCooldownMs: 30_000,
 			thinkingProfiles: {},
 		});
 	});
