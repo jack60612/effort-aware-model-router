@@ -365,6 +365,7 @@ describe("model router extension", () => {
 	});
 	it("offers every route command and preserves prefixes for selector completions", async () => {
 		const harness = new Harness();
+		harness.config = routerConfig({ thresholds: { low: ["@smol"] } });
 		await harness.lifecycle();
 		const values = (prefix: string): string[] => harness.complete(prefix)?.map(item => item.value) ?? [];
 
@@ -372,6 +373,8 @@ describe("model router extension", () => {
 		expect(values("set")).toEqual(["setup"]);
 		expect(values("manual ")).toContain("manual @tiny");
 		expect(values("once @t")).toContain("once @tiny");
+		expect(values("manual @s")).toContain("manual @slow");
+		expect(values("once @d")).toContain("once @default");
 	});
 	it("routes /route setup through the public UI seam and reloads written config", async () => {
 		const harness = new Harness();
