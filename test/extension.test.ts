@@ -19,7 +19,9 @@ import {
 } from "../src/state";
 
 type EventHandler = (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>;
-type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+type CommandOptions = Parameters<ExtensionAPI["registerCommand"]>[1];
+type CommandHandler = CommandOptions["handler"];
+type CommandCompletion = NonNullable<CommandOptions["getArgumentCompletions"]>;
 type TestEntry = { type: string; customType?: string; data?: unknown };
 
 type TestModel = Model & {
@@ -65,6 +67,7 @@ function routerConfig(overrides: Partial<RouterConfig> = {}): RouterConfig {
 class Harness {
 	readonly handlers = new Map<string, EventHandler>();
 	readonly commands = new Map<string, CommandHandler>();
+	readonly completions = new Map<string, CommandCompletion>();
 	readonly entries: TestEntry[] = [];
 	branchEntries: TestEntry[] | undefined;
 	readonly notifications: Array<{ message: string; type: string | undefined }> = [];
@@ -107,8 +110,9 @@ class Harness {
 			on(event: string, handler: EventHandler): void {
 				self.handlers.set(event, handler);
 			},
-			registerCommand(name: string, options: { handler: CommandHandler }): void {
+			registerCommand(name: string, options: CommandOptions): void {
 				self.commands.set(name, options.handler);
+				if (options.getArgumentCompletions) self.completions.set(name, options.getArgumentCompletions);
 			},
 			appendEntry(customType: string, data?: unknown): void {
 				const entry = { type: "custom", customType, data };
@@ -204,6 +208,9 @@ class Harness {
 
 	async command(args: string): Promise<void> {
 		await this.commands.get("route")?.(args, this.ctx);
+	}
+	complete(argumentPrefix: string) {
+		return this.completions.get("route")?.(argumentPrefix) ?? null;
 	}
 
 	state(): RouterState {
@@ -355,6 +362,16 @@ describe("model router extension", () => {
 		await harness.lifecycle();
 		await harness.command("not-a-route-command");
 		expect(harness.notifications.at(-1)?.message).toContain("setup");
+	});
+	it("offers every route command and preserves prefixes for selector completions", async () => {
+		const harness = new Harness();
+		await harness.lifecycle();
+		const values = (prefix: string): string[] => harness.complete(prefix)?.map(item => item.value) ?? [];
+
+		expect(values("")).toEqual(["auto", "manual", "off", "status", "explain", "history", "once", "setup", "reload"]);
+		expect(values("set")).toEqual(["setup"]);
+		expect(values("manual ")).toContain("manual @tiny");
+		expect(values("once @t")).toContain("once @tiny");
 	});
 	it("routes /route setup through the public UI seam and reloads written config", async () => {
 		const harness = new Harness();

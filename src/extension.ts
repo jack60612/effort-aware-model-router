@@ -43,6 +43,45 @@ const STATUS_KEY = "model-router";
 const COMMAND_USAGE =
 	"Usage: /route auto | manual [selector] | off | status | explain | history | once <selector> | setup | reload";
 
+const ROUTE_COMMAND_COMPLETIONS = [
+	{ label: "auto", value: "auto", description: "Enable automatic effort-aware routing" },
+	{ label: "manual", value: "manual", description: "Pin a baseline model selector" },
+	{ label: "off", value: "off", description: "Disable automatic routing" },
+	{ label: "status", value: "status", description: "Show the current routing mode and target" },
+	{ label: "explain", value: "explain", description: "Show the latest routing decision details" },
+	{ label: "history", value: "history", description: "Show recent routing decisions" },
+	{ label: "once", value: "once", description: "Route the next prompt to a model selector" },
+	{ label: "setup", value: "setup", description: "Configure routing interactively" },
+	{ label: "reload", value: "reload", description: "Reload routing configuration from disk" },
+];
+
+function configuredRouteSelectors(config: RouterConfig): string[] {
+	const selectors = new Set(config.classifierModels);
+	for (const candidates of Object.values(config.thresholds)) {
+		for (const selector of candidates ?? []) selectors.add(selector);
+	}
+	for (const selector of Object.keys(config.thinkingProfiles)) selectors.add(selector);
+	return [...selectors];
+}
+
+function routeArgumentCompletions(argumentPrefix: string, config: RouterConfig) {
+	const trimmed = argumentPrefix.trimStart();
+	const firstWhitespace = trimmed.search(/\s/);
+	if (firstWhitespace === -1) {
+		const normalized = trimmed.toLowerCase();
+		return ROUTE_COMMAND_COMPLETIONS.filter(item => item.label.startsWith(normalized));
+	}
+
+	const command = trimmed.slice(0, firstWhitespace).toLowerCase();
+	if (command !== "manual" && command !== "once") return null;
+	const selectorPrefix = trimmed.slice(firstWhitespace).trimStart().toLowerCase();
+	const description =
+		command === "once" ? "Route the next prompt to this model selector" : "Use this model selector as the baseline";
+	return configuredRouteSelectors(config)
+		.filter(selector => selector.toLowerCase().startsWith(selectorPrefix))
+		.map(selector => ({ label: selector, value: `${command} ${selector}`, description }));
+}
+
 type LoadConfig = typeof loadRouterConfig;
 type Classify = typeof classifyPromptEffort;
 type ExtensionThinkingLevel = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
@@ -505,6 +544,7 @@ export function createModelRouterExtension(
 
 		pi.registerCommand("route", {
 			description: "Control effort-aware automatic model routing",
+			getArgumentCompletions: argumentPrefix => routeArgumentCompletions(argumentPrefix, config),
 			async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
 				const parts = args.trim().split(/\s+/).filter(Boolean);
 				const command = parts[0] ?? "status";

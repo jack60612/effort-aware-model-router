@@ -158,7 +158,7 @@ describe("runRouterSetup", () => {
 				"@tiny",
 				"@smol",
 				"low",
-				"mock/smol",
+				"@tiny",
 				"done",
 				"mock/smol",
 				"low",
@@ -180,7 +180,7 @@ describe("runRouterSetup", () => {
 			classifierModels: ["@tiny", "@smol"],
 			classifierMinPromptChars: 4,
 			classifierCooldownMs: 5_000,
-			thresholds: { low: ["mock/smol"], high: ["@slow"] },
+			thresholds: { low: ["@tiny"], high: ["@slow"] },
 			thinkingProfiles: { "mock/smol": { default: "low", xhigh: "medium" } },
 		});
 		expect(ui.inputTitles).toEqual(["Skip prompts shorter than this many characters"]);

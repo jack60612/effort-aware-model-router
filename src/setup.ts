@@ -255,12 +255,13 @@ export async function runRouterSetup(
 	const classifierCooldownMs = selectedCooldown.milliseconds;
 
 	const available = [
-		...new Set(
-			context.models
+		...new Set([
+			...config.classifierModels,
+			...context.models
 				.list()
 				.map(modelSelector)
 				.filter((selector): selector is string => selector !== undefined),
-		),
+		]),
 	];
 	const selectedClassifierModels = await selectOrderedModels(
 		context,
