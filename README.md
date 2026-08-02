@@ -48,7 +48,7 @@ The default thresholds produce:
 
 `max` is not offered by the default classifier prompt because the default `maxEffort` is `xhigh`. Set `maxEffort` to `max` and add or inherit the thresholds you want if classification should be able to return `max`.
 
-If `classifierMinPromptChars` is non-zero, prompts shorter than that trimmed character count skip classification. If `classifierCooldownMs` is non-zero, prompts arriving during the cooldown after the last classification also skip classification. Both safeguards are disabled by default.
+By default, prompts shorter than 30 trimmed characters skip classification, and eligible prompts wait 30 seconds after the last classification. Set either field to `0` to disable that safeguard.
 
 If the target is already current, the router avoids a redundant model switch but still applies a supported thinking level. Non-reasoning models, and models without controllable effort metadata, receive no explicit thinking-level change.
 
@@ -73,8 +73,8 @@ For example, this is the complete built-in configuration:
   "classifierModels": ["@tiny", "@smol"],
   "maxEffort": "xhigh",
   "classifierTimeoutMs": 4000,
-  "classifierMinPromptChars": 0,
-  "classifierCooldownMs": 0,
+  "classifierMinPromptChars": 30,
+  "classifierCooldownMs": 30000,
   "thinkingProfiles": {}
 }
 ```
@@ -86,8 +86,8 @@ For example, this is the complete built-in configuration:
 | `classifierModels` | non-empty string array | Ordered model selectors. The first selector that resolves and has credentials performs the one direct classification call. A valid later layer replaces the entire array. |
 | `maxEffort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Caps the returned classification. The classifier prompt offers `max` only when this field is `max`. |
 | `classifierTimeoutMs` | positive integer | Timeout in milliseconds used for classifier credential lookup and completion. |
-| `classifierMinPromptChars` | non-negative integer | Skips classification for prompts whose trimmed text is shorter than this value. `0` disables the minimum. |
-| `classifierCooldownMs` | non-negative integer | Skips classification until this many milliseconds have elapsed since the last classification attempt. `0` disables the cooldown. |
+| `classifierMinPromptChars` | non-negative integer | Skips classification for prompts whose trimmed text is shorter than this value. The default is `30`; `0` disables the minimum. |
+| `classifierCooldownMs` | non-negative integer | Skips classification until this many milliseconds have elapsed since the last classification attempt. The default is `30000` (30 seconds); `0` disables the cooldown. |
 | `thinkingProfiles` | object | Maps an exact `provider/model` identity to `default` and/or classified-effort thinking overrides. Exact effort override wins over `default`, which wins over the classified effort; the result is clamped to the target model's supported thinking metadata. |
 
 Unknown fields, unknown threshold names, inherited properties, and invalid field values are ignored. An unreadable file or invalid JSON layer is ignored. Threshold objects merge by valid effort key; omission does not remove a threshold inherited from defaults or an earlier layer. Thinking profiles merge by exact model key and field.
