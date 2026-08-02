@@ -50,10 +50,13 @@ const plain = model("plain", { reasoning: false });
 function routerConfig(overrides: Partial<RouterConfig> = {}): RouterConfig {
 	return {
 		enabled: true,
-		thresholds: { low: "@smol", high: "@slow" },
+		thresholds: { low: ["@smol"], high: ["@slow"] },
 		classifierModels: ["@tiny", "@smol"],
 		maxEffort: "xhigh",
 		classifierTimeoutMs: 4_000,
+		classifierMinPromptChars: 0,
+		classifierCooldownMs: 0,
+		thinkingProfiles: {},
 		...overrides,
 	};
 }
@@ -77,6 +80,7 @@ class Harness {
 	contextAvailable = true;
 	setModelResults: Array<boolean | Error> = [];
 	config = routerConfig();
+	now = 1_000;
 	loadCount = 0;
 	classifications: Array<RouteEffort | Error> = ["low"];
 
@@ -176,6 +180,7 @@ class Harness {
 				if (next instanceof Error) throw next;
 				return next;
 			},
+			now: () => this.now,
 		})(this.api);
 	}
 
@@ -281,7 +286,7 @@ describe("model router extension", () => {
 		const harness = new Harness();
 		harness.current = smol;
 		harness.classifications = ["medium", "high"];
-		harness.config = routerConfig({ thresholds: { low: "@smol", high: "@plain" } });
+		harness.config = routerConfig({ thresholds: { low: ["@smol"], high: ["@plain"] } });
 		await harness.lifecycle();
 		await harness.input("localized work");
 		expect(harness.setModelCalls).toEqual([]);
@@ -294,7 +299,7 @@ describe("model router extension", () => {
 	it("clamps unsupported high effort downward on a reasoning model", async () => {
 		const harness = new Harness();
 		harness.classifications = ["xhigh"];
-		harness.config = routerConfig({ thresholds: { high: "@smol" } });
+		harness.config = routerConfig({ thresholds: { high: ["@smol"] } });
 		await harness.lifecycle();
 		await harness.input("deep task");
 		expect(harness.thinkingCalls).toEqual(["medium"]);
@@ -368,7 +373,7 @@ describe("model router extension", () => {
 		const tiny = model("tiny-context", { contextWindow: 100 });
 		const harness = new Harness();
 		harness.selectors.set("@tiny-context", tiny);
-		harness.config = routerConfig({ thresholds: { low: "@tiny-context" } });
+		harness.config = routerConfig({ thresholds: { low: ["@tiny-context"] } });
 		harness.contextTokens = 99;
 		await harness.lifecycle();
 		await harness.input("this prompt cannot fit");
@@ -406,7 +411,7 @@ describe("model router extension", () => {
 
 		const selectorFailure = new Harness([resumedEntry]);
 		selectorFailure.current = slow;
-		selectorFailure.config = routerConfig({ thresholds: { low: "@smol", high: "@missing" } });
+		selectorFailure.config = routerConfig({ thresholds: { low: ["@smol"], high: ["@missing"] } });
 		selectorFailure.classifications = ["high"];
 		await selectorFailure.lifecycle();
 		await selectorFailure.input("hard");
@@ -487,5 +492,132 @@ describe("model router extension", () => {
 		for (const text of ["", "   ", "/help", "-> queued", "=> follow up"]) await harness.input(text);
 		expect(harness.classifierPrompts).toEqual([]);
 		expect(harness.setModelCalls).toEqual([]);
+	});
+
+	it("tries ordered candidates through resolution and authentication before baseline fallback", async () => {
+		const first = model("first");
+		const second = model("second");
+		const harness = new Harness();
+		harness.selectors.set("@first", first);
+		harness.selectors.set("@second", second);
+		harness.config = routerConfig({ thresholds: { low: ["@missing", "@first", "@second"] } });
+		harness.setModelResults = [false, true];
+		await harness.lifecycle();
+		await harness.input("try candidates");
+
+		expect(harness.resolvedSelectors).toEqual(["@missing", "@first", "@second"]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["first", "second"]);
+		expect(harness.state().lastDecision).toMatchObject({
+			outcome: "routed",
+			candidates: ["@missing", "@first", "@second"],
+			selectedCandidate: "@second",
+			attempts: [
+				{ selector: "@missing", outcome: "selector" },
+				{ selector: "@first", outcome: "auth" },
+				{ selector: "@second", outcome: "selected" },
+			],
+		});
+	});
+
+	it("skips a context-incompatible candidate and routes to the next candidate", async () => {
+		const tiny = model("tiny", { contextWindow: 100 });
+		const second = model("second");
+		const harness = new Harness();
+		harness.selectors.set("@tiny", tiny);
+		harness.selectors.set("@second", second);
+		harness.config = routerConfig({ thresholds: { low: ["@tiny", "@second"] } });
+		harness.contextTokens = 100;
+		await harness.lifecycle();
+		await harness.input("next");
+
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["second"]);
+		expect(harness.state().lastDecision?.attempts).toEqual([
+			{ selector: "@tiny", outcome: "context" },
+			{ selector: "@second", outcome: "selected" },
+		]);
+	});
+
+	it("applies exact model thinking profiles before metadata clamping", async () => {
+		const harness = new Harness();
+		harness.config = routerConfig({
+			thresholds: { high: ["@smol"] },
+			thinkingProfiles: { "mock/smol": { default: "low", xhigh: "high" } },
+		});
+		harness.classifications = ["xhigh"];
+		await harness.lifecycle();
+		await harness.input("profiled effort");
+
+		expect(harness.thinkingCalls).toEqual(["medium"]);
+		expect(harness.state().lastDecision).toMatchObject({
+			profileEffort: "high",
+			thinking: "medium",
+		});
+	});
+
+	it("skips short prompts and classifier calls inside the cooldown window", async () => {
+		const harness = new Harness();
+		harness.config = routerConfig({ classifierMinPromptChars: 8, classifierCooldownMs: 1_000 });
+		harness.classifications = ["low", "high"];
+		await harness.lifecycle();
+		await harness.input("short");
+		expect(harness.classifierPrompts).toEqual([]);
+
+		await harness.input("long enough");
+		expect(harness.classifierPrompts).toEqual(["long enough"]);
+		harness.now = 1_500;
+		await harness.input("cooldown prompt");
+		expect(harness.classifierPrompts).toEqual(["long enough"]);
+		harness.now = 2_000;
+		await harness.input("after cooldown");
+		expect(harness.classifierPrompts).toEqual(["long enough", "after cooldown"]);
+	});
+
+	it("routes one explicit prompt without changing persistent mode", async () => {
+		const harness = new Harness();
+		await harness.lifecycle();
+		await harness.command("off");
+		await harness.command("once @slow");
+		await harness.input("one shot");
+
+		expect(harness.classifierPrompts).toEqual([]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["slow"]);
+		expect(harness.state().mode).toBe("off");
+		expect(harness.state().oneShotSelector).toBeUndefined();
+	});
+
+	it("explains the latest decision and bounded history through commands", async () => {
+		const harness = new Harness();
+		harness.classifications = ["low", "high"];
+		await harness.lifecycle();
+		await harness.input("easy");
+		await harness.input("hard");
+		await harness.command("explain");
+		await harness.command("history");
+
+		const messages = harness.notifications.map(item => item.message).join("\n");
+		expect(messages).toContain("Candidates");
+		expect(messages).toContain("history");
+		expect(messages).toContain("@slow");
+	});
+
+	it("restores legacy version-1 state through the lifecycle hook", async () => {
+		const harness = new Harness([
+			{
+				type: "custom",
+				customType: MODEL_ROUTER_STATE_ENTRY,
+				data: {
+					version: 1,
+					mode: "manual",
+					baseline: base,
+					observedModel: base,
+					lastAutoModel: null,
+					lastDecision: null,
+					warningKeys: [],
+				},
+			},
+		]);
+		await harness.lifecycle();
+		expect(harness.state().version).toBe(2);
+		expect(harness.state().history).toEqual([]);
 	});
 });
