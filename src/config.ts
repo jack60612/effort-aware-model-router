@@ -23,7 +23,7 @@ export interface RouterConfig {
 }
 
 export type RouterConfigLayer = Partial<Omit<RouterConfig, "thresholds" | "thinkingProfiles">> & {
-	thresholds?: RouterThresholds;
+	thresholds?: Partial<Record<RouteEffort, RouterThresholdInput>>;
 	thinkingProfiles?: RouterThinkingProfiles;
 };
 

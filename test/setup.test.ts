@@ -118,6 +118,24 @@ describe("writeRouterConfigLayer", () => {
 		});
 		expect(written.enabled).toBe(true);
 	});
+	it("preserves prototype-shaped profile keys as inert JSON data", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		const thinkingProfiles = Object.create(null) as RouterSetupValues["thinkingProfiles"];
+		Object.defineProperty(thinkingProfiles, "__proto__", {
+			value: { default: "low" },
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+
+		await writeRouterConfigLayer(file, values({ thinkingProfiles }));
+		const written = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		const profiles = written.thinkingProfiles as Record<string, unknown>;
+
+		expect(Object.hasOwn(profiles, "__proto__")).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(profiles, "__proto__")?.value).toEqual({ default: "low" });
+		expect(Object.getPrototypeOf(profiles)).toBe(Object.prototype);
+	});
 
 	it("refuses malformed existing JSON without changing it", async () => {
 		const file = path.join(cwd, ".omp", "model-router.json");
@@ -169,6 +187,21 @@ describe("runRouterSetup", () => {
 		expect(ui.selectTitles).toContain("Wait between automatic classifications");
 		expect(ui.selectOptions.flat()).not.toContain("custom selector");
 		expect(ui.inputTitles.some(title => title.toLowerCase().includes("model"))).toBe(false);
+	});
+	it("preserves a non-preset cooldown with a human-readable current option", async () => {
+		const ui = new FakeUI(
+			["project", "enabled", "Keep current — 2.5 seconds", "@tiny", "done", "none"],
+			["0"],
+			[false, true],
+		);
+		const result = await runRouterSetup(setupContext(ui), { ...config, classifierCooldownMs: 2_500 });
+
+		expect(result.status).toBe("written");
+		const written = JSON.parse(await fs.readFile(path.join(cwd, ".omp", "model-router.json"), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(written.classifierCooldownMs).toBe(2_500);
 	});
 
 	it("does not write when cancelled or when the UI surface is unavailable", async () => {

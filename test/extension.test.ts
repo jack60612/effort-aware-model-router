@@ -349,6 +349,12 @@ describe("model router extension", () => {
 		expect(harness.loadCount).toBe(2);
 		expect(harness.notifications.some(item => item.message.includes("reloaded"))).toBe(true);
 	});
+	it("includes setup in invalid-command usage", async () => {
+		const harness = new Harness();
+		await harness.lifecycle();
+		await harness.command("not-a-route-command");
+		expect(harness.notifications.at(-1)?.message).toContain("setup");
+	});
 	it("routes /route setup through the public UI seam and reloads written config", async () => {
 		const harness = new Harness();
 		await harness.lifecycle();

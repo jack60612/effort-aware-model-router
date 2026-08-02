@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, parseRouterConfigLayer } from "../src/config";
+import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, parseRouterConfigLayer, type RouterConfigLayer } from "../src/config";
 
 let root: string;
 let homeDir: string;
@@ -153,6 +153,10 @@ describe("parseRouterConfigLayer", () => {
 			thresholds: { low: ["own/low"], max: ["own/max"] },
 			classifierModels: ["@tiny", "@smol"],
 		});
+	});
+	it("accepts legacy string thresholds in the config-layer type", () => {
+		const layer: RouterConfigLayer = { thresholds: { low: "legacy/low" } };
+		expect(parseRouterConfigLayer(layer)).toEqual({ thresholds: { low: ["legacy/low"] } });
 	});
 
 	it("ignores classifier selectors inherited through a sparse array prototype", () => {

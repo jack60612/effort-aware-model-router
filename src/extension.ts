@@ -41,7 +41,7 @@ import {
 
 const STATUS_KEY = "model-router";
 const COMMAND_USAGE =
-	"Usage: /route auto | manual [selector] | off | status | explain | history | once <selector> | reload";
+	"Usage: /route auto | manual [selector] | off | status | explain | history | once <selector> | setup | reload";
 
 type LoadConfig = typeof loadRouterConfig;
 type Classify = typeof classifyPromptEffort;

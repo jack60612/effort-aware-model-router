@@ -93,8 +93,8 @@ function formatCooldown(milliseconds: number): string {
 		const minutes = milliseconds / 60_000;
 		return `${minutes} minute${minutes === 1 ? "" : "s"}`;
 	}
-	if (milliseconds % 1_000 === 0) {
-		const seconds = milliseconds / 1_000;
+	if (milliseconds >= 1_000) {
+		const seconds = Number((milliseconds / 1_000).toFixed(1));
 		return `${seconds} second${seconds === 1 ? "" : "s"}`;
 	}
 	return `${milliseconds} milliseconds`;
@@ -178,7 +178,8 @@ export async function writeRouterConfigLayer(
 		!Array.isArray(existing.thinkingProfiles)
 			? (existing.thinkingProfiles as Record<string, unknown>)
 			: {};
-	const mergedProfiles: Record<string, unknown> = { ...existingProfiles };
+	const mergedProfiles: Record<string, unknown> = Object.create(null);
+	Object.assign(mergedProfiles, existingProfiles);
 	for (const [modelKey, profile] of Object.entries(values.thinkingProfiles)) {
 		const previous =
 			typeof mergedProfiles[modelKey] === "object" &&
