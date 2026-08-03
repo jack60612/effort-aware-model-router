@@ -22,6 +22,24 @@ export {
 	validateParallelWorkflowManifest,
 } from "./contracts";
 export {
+	buildParallelReviewPrompt,
+	PARALLEL_REVIEW_OUTPUT_MAX_CHARS,
+	ParallelCoordinator,
+	type ParallelCoordinatorDependencies,
+	type ParallelCoordinatorHost,
+	type ParallelCoordinatorStore,
+	type ParallelExec,
+	type ParallelPreflightIssue,
+	type ParallelPreflightIssueKind,
+	type ParallelPreflightResult,
+	type ParallelReviewVerdict,
+	type ParallelRunSnapshot,
+	type ParallelSubagentRequest,
+	type ParallelSubagentResult,
+	type ParallelSubagentRunner,
+	parseParallelReviewVerdict,
+} from "./coordinator";
+export {
 	decideParallelSchedule,
 	type ParallelReviewFinding,
 	type ParallelReviewState,
