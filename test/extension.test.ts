@@ -917,11 +917,65 @@ describe("model router delegation", () => {
 		harness.classifications = [deferred.classify, "low"];
 		harness.planResults = [{ delegate: false, reason: "needs context" }];
 		expect(await harness.input("first self-contained request")).toEqual({ handled: true });
-		expect(await harness.input("second request during workflow")).toBeUndefined();
+		const second = harness.input("second request during workflow");
 		expect(harness.delegationEntries()).toHaveLength(1);
 		deferred.resolve("low");
+		expect(await second).toBeUndefined();
+		expect(harness.delegationEntries().filter(entry => entry.status === "pending")).toHaveLength(1);
 		await harness.settle(() => harness.userMessages.length === 1);
 		expect(harness.planCalls).toHaveLength(1);
+	});
+
+	it("serializes detached delegation routing against later main-path routing", async () => {
+		const harness = await enabledHarness();
+		const deferred = deferredEffort();
+		harness.classifications = [deferred.classify, "high"];
+		harness.planResults = [{ delegate: false, reason: "needs context" }];
+		expect(await harness.input("first self-contained request")).toEqual({ handled: true });
+		await harness.settle(() => harness.classifierPrompts.length === 1);
+
+		let secondSettled = false;
+		const second = harness.input("second concurrent request").then(result => {
+			secondSettled = true;
+			return result;
+		});
+		for (let turn = 0; turn < 50; turn += 1) await Promise.resolve();
+		expect(secondSettled).toBe(false);
+		expect(harness.classifierPrompts).toEqual(["first self-contained request"]);
+		expect(harness.setModelCalls).toEqual([]);
+
+		deferred.resolve("low");
+		expect(await second).toBeUndefined();
+		expect(harness.classifierPrompts).toEqual(["first self-contained request", "second concurrent request"]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["smol", "slow"]);
+		expect(harness.current?.id).toBe("slow");
+		await harness.settle(() => harness.userMessages.length === 1);
+	});
+
+	it("treats a child-reported abort without user cancellation as a guarded failure", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		harness.executeResults = [
+			singleResult({ aborted: true, abortReason: "wall clock exceeded", exitCode: 1, output: "" }),
+		];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+
+		expect(harness.customMessages[0]?.content).toContain("wall clock exceeded");
+		expect(harness.userMessages[0]?.deliverAs).toBe("followUp");
+		expect(harness.userMessages[0]?.content).toContain("the original standalone request");
+		expect(harness.userMessages[0]?.content).toContain("side effects");
+		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+	});
+
+	it("answers status and early input safely before any lifecycle event", async () => {
+		const harness = new Harness();
+		await harness.command("status");
+		expect(harness.notifications.at(-1)?.message).toContain("delegation off");
+		expect(await harness.input("an early eligible standalone request")).toBeUndefined();
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
 	});
 
 	it("claims eligible input immediately with a pending entry before classification resolves", async () => {

@@ -220,6 +220,11 @@ function defaultConfig(): RouterConfig {
 				{ ...profile },
 			]),
 		),
+		delegation: {
+			enabled: DEFAULT_ROUTER_CONFIG.delegation.enabled,
+			plannerTimeoutMs: DEFAULT_ROUTER_CONFIG.delegation.plannerTimeoutMs,
+			agents: [...DEFAULT_ROUTER_CONFIG.delegation.agents],
+		},
 	};
 }
 
@@ -438,7 +443,10 @@ export function createModelRouterExtension(
 			persist(ctx);
 		};
 
-		const routePrompt = async (event: InputEvent, ctx: ExtensionContext): Promise<RoutedPrompt | undefined> => {
+		const applyRoutePrompt = async (
+			event: InputEvent,
+			ctx: ExtensionContext,
+		): Promise<RoutedPrompt | undefined> => {
 			const runtime = ensureState(ctx);
 			const oneShotSelector = runtime.oneShotSelector;
 			if (oneShotSelector === undefined && runtime.mode !== "auto") return;
@@ -590,6 +598,21 @@ export function createModelRouterExtension(
 			};
 		};
 
+		/**
+		 * Serialize every route application: the detached delegation pipeline and a
+		 * later main-path prompt share model/thinking/router state, so concurrent
+		 * applyRoutePrompt runs would interleave setModel and decision records.
+		 */
+		let routeTurn: Promise<unknown> = Promise.resolve();
+		const routePrompt = (event: InputEvent, ctx: ExtensionContext): Promise<RoutedPrompt | undefined> => {
+			const run = routeTurn.then(() => applyRoutePrompt(event, ctx));
+			routeTurn = run.then(
+				() => undefined,
+				() => undefined,
+			);
+			return run;
+		};
+
 		const delegationStatus = (): string =>
 			`delegation ${config.delegation.enabled ? "on" : "off"} (${activeDelegation ? "active" : "idle"})`;
 
@@ -695,7 +718,10 @@ export function createModelRouterExtension(
 					signal: controller.signal,
 					keepAlive: false,
 				});
-				if (controller.signal.aborted || result.aborted) return cancelled({ agent: definition.name });
+				if (controller.signal.aborted) return cancelled({ agent: definition.name });
+				if (result.aborted) {
+					return childFailure(result.abortReason ?? result.error ?? "subagent aborted before completion");
+				}
 				if (result.exitCode !== 0 || result.error) {
 					return childFailure(result.error ?? `subagent exited with code ${result.exitCode}`);
 				}
