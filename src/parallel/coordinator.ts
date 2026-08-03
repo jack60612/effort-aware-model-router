@@ -5,6 +5,7 @@ import { type AgentDefinition, isReadOnlyAgent, type SingleResult } from "@oh-my
 import {
 	type CommitToBranchResult,
 	captureBaseline,
+	captureDeltaPatch,
 	cleanupIsolation,
 	cleanupTaskBranches,
 	commitToBranch,
@@ -77,6 +78,10 @@ export interface ParallelCoordinatorStore {
 	updateRun(runId: string, patch: ParallelRunPatch): void;
 	updateShard(runId: string, shardId: string, patch: ParallelShardPatch): void;
 	updateReview(runId: string, shardId: string, patch: ParallelReviewPatch): void;
+	/** Atomically claim exclusive run ownership; rejects a live foreign owner. */
+	claimRun(runId: string): void;
+	/** Release run ownership; a no-op unless this instance is the owner. */
+	releaseRun(runId: string): void;
 }
 
 export interface ParallelCoordinatorDependencies {
@@ -103,6 +108,10 @@ export interface ParallelCoordinatorDependencies {
 	createReviewWorktree?: (repoRoot: string, branchName: string, worktreeId: string) => Promise<string>;
 	/** Remove a temporary review worktree; must never throw fatally. */
 	removeReviewWorktree?: (repoRoot: string, worktreeDir: string) => Promise<void>;
+	/** Merge completed dependency branches into a shard's isolated worktree in manifest order. */
+	materializeDependencyBranches?: (worktreeDir: string, branchNames: readonly string[]) => Promise<void>;
+	/** Net project-relative POSIX paths changed in isolation vs the baseline. */
+	captureChangedPaths?: (isolationDir: string, baseline: WorktreeBaseline) => Promise<readonly string[]>;
 }
 
 export type ParallelPreflightIssueKind = "missing-agent" | "missing-reviewer" | "reviewer-not-read-only";
@@ -201,6 +210,70 @@ export function buildParallelReviewPrompt(shard: ParallelShardSpec): string {
 }
 
 /**
+ * Touched project-relative POSIX paths named by one `git diff` patch.
+ * Reads `---`/`+++`/`rename`/`copy` header lines inside each `diff --git`
+ * block, falls back to the `diff --git` line itself for header-only entries
+ * (binary changes), unquotes quoted paths, and ignores `/dev/null` sides.
+ */
+export function parallelPatchTouchedPaths(patch: string): string[] {
+	const paths = new Set<string>();
+	const add = (raw: string, prefix: "a/" | "b/" | null): void => {
+		let value = raw.trim();
+		if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+			try {
+				value = JSON.parse(value) as string;
+			} catch {
+				value = value.slice(1, -1);
+			}
+		}
+		if (value.length === 0 || value === "/dev/null") return;
+		if (prefix !== null) {
+			if (!value.startsWith(prefix)) return;
+			value = value.slice(prefix.length);
+		}
+		if (value.startsWith("./")) value = value.slice(2);
+		if (value.length > 0) paths.add(value);
+	};
+	let inHeader = false;
+	for (const line of patch.split("\n")) {
+		if (line.startsWith("diff --git ")) {
+			inHeader = true;
+			const body = line.slice("diff --git ".length);
+			// The exact same-path form `a/P b/P` survives spaces inside P.
+			let matched = false;
+			for (let index = body.indexOf(" b/"); index !== -1; index = body.indexOf(" b/", index + 1)) {
+				const left = body.slice(0, index);
+				if (left.startsWith("a/") && left.slice(2) === body.slice(index + 3)) {
+					add(left, "a/");
+					matched = true;
+					break;
+				}
+			}
+			if (!matched) {
+				const halves = body.match(/^("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)$/);
+				if (halves !== null) {
+					add(halves[1] ?? "", "a/");
+					add(halves[2] ?? "", "b/");
+				}
+			}
+			continue;
+		}
+		if (!inHeader) continue;
+		if (line.startsWith("@@") || line.startsWith("Binary files ") || line.startsWith("GIT binary patch")) {
+			inHeader = false;
+			continue;
+		}
+		if (line.startsWith("--- ")) add(line.slice(4), "a/");
+		else if (line.startsWith("+++ ")) add(line.slice(4), "b/");
+		else if (line.startsWith("rename from ")) add(line.slice("rename from ".length), null);
+		else if (line.startsWith("rename to ")) add(line.slice("rename to ".length), null);
+		else if (line.startsWith("copy from ")) add(line.slice("copy from ".length), null);
+		else if (line.startsWith("copy to ")) add(line.slice("copy to ".length), null);
+	}
+	return [...paths].sort();
+}
+
+/**
  * Owns preflight, dispatch, review gates, cancellation, recovery, and
  * integration for parallel workflow runs. All provider and git effects flow
  * through the injected host/dependency seams; nothing here touches the
@@ -229,8 +302,18 @@ export class ParallelCoordinator {
 	private readonly cleanupTaskBranches: (repoRoot: string, branches: string[]) => Promise<void>;
 	private readonly createReviewWorktree: (repoRoot: string, branchName: string, worktreeId: string) => Promise<string>;
 	private readonly removeReviewWorktree: (repoRoot: string, worktreeDir: string) => Promise<void>;
+	private readonly materializeDependencyBranches: (
+		worktreeDir: string,
+		branchNames: readonly string[],
+	) => Promise<void>;
+	private readonly captureChangedPaths: (
+		isolationDir: string,
+		baseline: WorktreeBaseline,
+	) => Promise<readonly string[]>;
 	private readonly controllers = new Map<string, Set<AbortController>>();
 	private readonly active = new Map<string, Set<Promise<unknown>>>();
+	private readonly leases = new Map<string, number>();
+	private readonly integrations = new Map<string, Promise<ParallelRunSnapshot>>();
 
 	constructor(host: ParallelCoordinatorHost, dependencies: ParallelCoordinatorDependencies) {
 		this.host = host;
@@ -268,6 +351,44 @@ export class ParallelCoordinator {
 			dependencies.removeReviewWorktree ??
 			(async (repoRoot, worktreeDir) => {
 				await this.host.exec("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreeDir]);
+			});
+		this.materializeDependencyBranches =
+			dependencies.materializeDependencyBranches ??
+			(async (worktreeDir, branchNames) => {
+				if (branchNames.length === 0) return;
+				const branchList = branchNames.join(" ");
+				// One octopus merge keeps every dependency staged in the isolated
+				// view while producing only one MERGE_HEAD state to clear.
+				const mergeResult = await this.host.exec("git", [
+					"-C",
+					worktreeDir,
+					"merge",
+					"--no-commit",
+					"--no-ff",
+					...branchNames,
+				]);
+				if (mergeResult.exitCode !== 0) {
+					throw new Error(`git merge --no-commit --no-ff ${branchList} failed: ${mergeResult.stderr.trim()}`);
+				}
+				const quitResult = await this.host.exec("git", ["-C", worktreeDir, "merge", "--quit"]);
+				if (quitResult.exitCode !== 0) {
+					throw new Error(
+						`git merge --quit after materializing ${branchList} failed: ${quitResult.stderr.trim()}`,
+					);
+				}
+			});
+		this.captureChangedPaths =
+			dependencies.captureChangedPaths ??
+			(async (isolationDir, baseline) => {
+				const delta = await captureDeltaPatch(isolationDir, baseline);
+				const paths = new Set<string>(parallelPatchTouchedPaths(delta.rootPatch));
+				for (const nested of delta.nestedPatches) {
+					const base = nested.relativePath.replace(/\\/g, "/").replace(/\/+$/, "");
+					for (const touched of parallelPatchTouchedPaths(nested.patch)) {
+						paths.add(base.length === 0 ? touched : `${base}/${touched}`);
+					}
+				}
+				return [...paths].sort();
 			});
 	}
 
@@ -328,20 +449,29 @@ export class ParallelCoordinator {
 	 * Never merges and never bypasses a required review rejection.
 	 */
 	async resume(runId: string): Promise<ParallelRunSnapshot> {
-		const promise = this.resumeInner(runId);
+		const promise = this.withRunLease(runId, () => this.resumeInner(runId));
 		this.trackActive(runId, promise);
 		return promise;
 	}
 
 	/** Retry every non-approved review whose shard already produced a result. */
 	async review(runId: string): Promise<ParallelRunSnapshot> {
-		const promise = this.reviewInner(runId);
+		const promise = this.withRunLease(runId, () => this.reviewInner(runId));
 		this.trackActive(runId, promise);
 		return promise;
 	}
 
-	/** Abort active work and mark every nonterminal row cancelled. */
+	/**
+	 * Abort active work and mark every nonterminal row cancelled. Runs under
+	 * the shared refcounted lease: an idle cancel claims and releases the
+	 * run (rejecting a live foreign owner), while a cancel overlapping a
+	 * local resume/review/integrate only piggybacks on the claim they hold.
+	 */
 	async cancel(runId: string): Promise<ParallelRunSnapshot> {
+		return this.withRunLease(runId, async () => this.cancelInner(runId));
+	}
+
+	private cancelInner(runId: string): ParallelRunSnapshot {
 		const stored = this.requireRun(runId);
 		for (const controller of this.controllers.get(runId) ?? []) controller.abort();
 
@@ -368,8 +498,19 @@ export class ParallelCoordinator {
 	 * manifest order and cleans up only branches that actually merged;
 	 * a conflict leaves the run failed with every branch artifact retained.
 	 */
-	async integrate(runId: string): Promise<ParallelRunSnapshot> {
-		const promise = this.integrateInner(runId);
+	integrate(runId: string): Promise<ParallelRunSnapshot> {
+		// One in-flight integration per run: repeated local calls share the
+		// same promise instead of double-merging; the slot clears on settle.
+		const existing = this.integrations.get(runId);
+		if (existing !== undefined) return existing;
+		const promise = this.withRunLease(runId, () => this.integrateInner(runId));
+		this.integrations.set(runId, promise);
+		// `.then(done, done)` clears the slot in the first settle tier, so a
+		// caller resuming from `await` can never pick up the stale promise.
+		const done = (): void => {
+			if (this.integrations.get(runId) === promise) this.integrations.delete(runId);
+		};
+		void promise.then(done, done);
 		this.trackActive(runId, promise);
 		return promise;
 	}
@@ -403,6 +544,30 @@ export class ParallelCoordinator {
 				set.delete(promise);
 				if (set.size === 0 && this.active.get(runId) === set) this.active.delete(runId);
 			});
+	}
+
+	/**
+	 * Run one operation while holding the persisted run lease. Overlapping
+	 * local operations share a single claim via reference counting, so a
+	 * concurrent cancel can never release a lease a sibling still holds; the
+	 * store claim itself rejects runs owned by another live process.
+	 */
+	private async withRunLease<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+		this.requireRun(runId);
+		const held = this.leases.get(runId) ?? 0;
+		if (held === 0) this.store.claimRun(runId);
+		this.leases.set(runId, held + 1);
+		try {
+			return await operation();
+		} finally {
+			const remaining = (this.leases.get(runId) ?? 1) - 1;
+			if (remaining <= 0) {
+				this.leases.delete(runId);
+				this.store.releaseRun(runId);
+			} else {
+				this.leases.set(runId, remaining);
+			}
+		}
 	}
 
 	private requireRun(runId: string): ParallelStoredRun {
@@ -524,11 +689,20 @@ export class ParallelCoordinator {
 		const uniqueTaskId = `${runId}-${shard.id}`;
 		this.store.updateShard(runId, shard.id, { status: "running" });
 		try {
-			const baseline = await this.captureBaseline(repoRoot);
 			const handle = await this.ensureIsolation(repoRoot, uniqueTaskId);
 			let commit: CommitToBranchResult | null = null;
 			let output = "";
 			try {
+				await this.materializeDependencies(runId, plan, shard, handle.mergedDir);
+				// The baseline is captured inside the isolated view only after
+				// dependency materialization, so the committed delta is this
+				// shard's net work alone; the repo root is normalized back to
+				// the real repository so the task branch is created there.
+				const isolatedBaseline = await this.captureBaseline(handle.mergedDir);
+				const baseline: WorktreeBaseline = {
+					...isolatedBaseline,
+					root: { ...isolatedBaseline.root, repoRoot },
+				};
 				const result = await this.host.runSubagent({
 					cwd: repoRoot,
 					worktree: handle.mergedDir,
@@ -552,6 +726,15 @@ export class ParallelCoordinator {
 					return;
 				}
 				output = result.output;
+				const violations = await this.ownershipViolations(handle.mergedDir, baseline, shard);
+				if (violations.length > 0) {
+					this.store.updateShard(runId, shard.id, {
+						status: "failed",
+						error: `shard "${shard.id}" changed paths outside its owns list: ${violations.join(", ")}`,
+						outputExcerpt: output,
+					});
+					return;
+				}
 				commit = await this.commitToBranch(handle.mergedDir, baseline, uniqueTaskId, shard.prompt);
 			} finally {
 				await this.cleanupIsolation(handle);
@@ -587,6 +770,71 @@ export class ParallelCoordinator {
 				error: errorMessage(error),
 			});
 		}
+	}
+
+	/**
+	 * Merge every transitive completed dependency branch into one shard's
+	 * isolated worktree so downstream work sees upstream results. Branches
+	 * are passed to one merge in manifest order; a dependency that produced
+	 * no branch is a no-op; a merge failure fails this shard with all affected
+	 * branches named.
+	 */
+	private async materializeDependencies(
+		runId: string,
+		plan: ParallelWorkflowPlan,
+		shard: ParallelShardSpec,
+		worktreeDir: string,
+	): Promise<void> {
+		if (shard.dependsOn.length === 0) return;
+		const specById = new Map(plan.shards.map(spec => [spec.id, spec]));
+		const needed = new Set<string>();
+		const visit = (id: string): void => {
+			if (needed.has(id)) return;
+			needed.add(id);
+			for (const dependency of specById.get(id)?.dependsOn ?? []) visit(dependency);
+		};
+		for (const dependency of shard.dependsOn) visit(dependency);
+
+		const stored = this.requireRun(runId);
+		const branchByShardId = new Map(stored.shards.map(record => [record.shardId, record.branchName]));
+		const dependencies: Array<{ spec: ParallelShardSpec; branchName: string }> = [];
+		for (const spec of plan.shards) {
+			if (!needed.has(spec.id)) continue;
+			const branchName = branchByShardId.get(spec.id) ?? null;
+			if (branchName !== null) dependencies.push({ spec, branchName });
+		}
+		if (dependencies.length === 0) return;
+
+		try {
+			await this.materializeDependencyBranches(
+				worktreeDir,
+				dependencies.map(dependency => dependency.branchName),
+			);
+		} catch (error) {
+			const labels = dependencies.map(dependency => `"${dependency.spec.id}" (${dependency.branchName})`).join(", ");
+			const noun = dependencies.length === 1 ? "dependency" : "dependencies";
+			throw coordinatorError(
+				`failed to materialize ${noun} ${labels} for shard "${shard.id}": ${errorMessage(error)}`,
+			);
+		}
+	}
+
+	/** Net changed paths that fall outside the shard's declared `owns` scope. */
+	private async ownershipViolations(
+		isolationDir: string,
+		baseline: WorktreeBaseline,
+		shard: ParallelShardSpec,
+	): Promise<string[]> {
+		const changed = await this.captureChangedPaths(isolationDir, baseline);
+		const violations = new Set<string>();
+		for (const rawPath of changed) {
+			let candidate = rawPath.trim().replace(/\\/g, "/");
+			while (candidate.startsWith("./")) candidate = candidate.slice(2);
+			if (candidate.length === 0) continue;
+			const owned = shard.owns.some(owns => candidate === owns || candidate.startsWith(`${owns}/`));
+			if (!owned) violations.add(candidate);
+		}
+		return [...violations].sort();
 	}
 
 	private async runReview(

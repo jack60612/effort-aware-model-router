@@ -1321,6 +1321,42 @@ describe("model router delegation", () => {
 		expect(harness.measuredEntries()).toEqual([]);
 	});
 
+	it("makes a stale delegated route a strict no-op: no model, thinking, persistence, or notification writes", async () => {
+		const harness = await enabledHarness();
+		const deferred = deferredEffort();
+		harness.classifications = [deferred.classify];
+		expect(await harness.input("the original standalone request")).toEqual({ handled: true });
+		await harness.settle(() => harness.classifierPrompts.length === 1);
+
+		// The lifecycle switch bumps the delegation generation and aborts the
+		// claimed workflow while the queued route is still awaiting the classifier.
+		await harness.lifecycle("session_switch");
+		const entriesBefore = harness.entries.length;
+		const statusesBefore = harness.statuses.length;
+		const notificationsBefore = harness.notifications.length;
+
+		// Unguarded, "high" would switch base -> slow, set a thinking level, and
+		// persist a routed decision into the successor session.
+		deferred.resolve("high");
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.thinkingCalls).toEqual([]);
+		expect(harness.entries).toHaveLength(entriesBefore);
+		expect(harness.statuses).toHaveLength(statusesBefore);
+		expect(harness.notifications).toHaveLength(notificationsBefore);
+		expect(harness.userMessages).toEqual([]);
+		expect(harness.customMessages).toEqual([]);
+
+		// The successor session still routes ordinary input normally.
+		harness.config = routerConfig();
+		await harness.command("reload");
+		harness.classifications = ["high"];
+		await harness.input("a fresh successor prompt");
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["slow"]);
+		expect(harness.state().lastDecision).toMatchObject({ outcome: "routed" });
+	});
+
 	it("suppresses a stale child result after session switch: no entry, no message, no replay", async () => {
 		const harness = await enabledHarness();
 		harness.classifications = ["low"];

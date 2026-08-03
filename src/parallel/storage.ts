@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,7 +13,7 @@ import {
 } from "./contracts";
 import type { ParallelReviewFinding } from "./scheduler";
 
-export const PARALLEL_STORE_SCHEMA_VERSION = 1;
+export const PARALLEL_STORE_SCHEMA_VERSION = 2;
 export const PARALLEL_STORE_BUSY_TIMEOUT_MS = 5_000;
 export const PARALLEL_STORE_PROJECT_KEY_CHARS = 16;
 export const PARALLEL_STORE_RUN_ID_MAX_CHARS = 128;
@@ -150,6 +150,10 @@ export interface ParallelWorkflowStoreOptions {
 	env?: Record<string, string | undefined>;
 	/** Clock seam for deterministic timestamps. */
 	now?: () => number;
+	/** Owner PID recorded on claimed runs; defaults to process.pid. */
+	ownerPid?: number;
+	/** Liveness probe for foreign owner PIDs; defaults to `process.kill(pid, 0)`. */
+	isProcessAlive?: (pid: number) => boolean;
 }
 
 export interface ParallelStoreConnectionSettings {
@@ -160,8 +164,28 @@ export interface ParallelStoreConnectionSettings {
 	userVersion: number;
 }
 
+/** Persisted lease columns for one run; null fields mean the run is idle. */
+export interface ParallelRunOwnership {
+	ownerToken: string | null;
+	ownerPid: number | null;
+	claimedAt: number | null;
+}
+
 function storeError(message: string): Error {
 	return new Error(`Parallel workflow store: ${message}`);
+}
+
+/**
+ * Bounded default liveness probe: signal 0 never kills, EPERM still proves
+ * the PID is alive, and any other failure means the process is gone.
+ */
+function defaultProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }
 
 /** Clamp one stored string; a capped value keeps a trailing ellipsis marker. */
@@ -280,7 +304,10 @@ const SCHEMA_STATEMENTS = [
 		status TEXT NOT NULL,
 		last_error TEXT,
 		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL
+		updated_at INTEGER NOT NULL,
+		owner_token TEXT,
+		owner_pid INTEGER,
+		owner_claimed_at INTEGER
 	)`,
 	`CREATE TABLE IF NOT EXISTS workflow_shards (
 		run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
@@ -311,6 +338,13 @@ const SCHEMA_STATEMENTS = [
 	)`,
 ] as const;
 
+/** In-place upgrade from schema version 1: add the per-run lease columns. */
+const SCHEMA_V2_MIGRATION_STATEMENTS = [
+	"ALTER TABLE workflow_runs ADD COLUMN owner_token TEXT",
+	"ALTER TABLE workflow_runs ADD COLUMN owner_pid INTEGER",
+	"ALTER TABLE workflow_runs ADD COLUMN owner_claimed_at INTEGER",
+] as const;
+
 interface RunRow {
 	run_id: string;
 	cwd: string;
@@ -323,6 +357,9 @@ interface RunRow {
 	last_error: string | null;
 	created_at: number;
 	updated_at: number;
+	owner_token: string | null;
+	owner_pid: number | null;
+	owner_claimed_at: number | null;
 }
 
 interface ShardRow {
@@ -360,20 +397,35 @@ export class ParallelWorkflowStore {
 	readonly databasePath: string;
 	private readonly db: Database;
 	private readonly now: () => number;
+	/** Unique per-instance lease token; never persisted across opens. */
+	readonly ownerToken: string;
+	private readonly ownerPid: number;
+	private readonly processAlive: (pid: number) => boolean;
 
-	private constructor(cwd: string, repoRoot: string, databasePath: string, db: Database, now: () => number) {
+	private constructor(
+		cwd: string,
+		repoRoot: string,
+		databasePath: string,
+		db: Database,
+		now: () => number,
+		ownerPid: number,
+		processAlive: (pid: number) => boolean,
+	) {
 		this.cwd = cwd;
 		this.repoRoot = repoRoot;
 		this.databasePath = databasePath;
 		this.db = db;
 		this.now = now;
+		this.ownerToken = randomUUID();
+		this.ownerPid = ownerPid;
+		this.processAlive = processAlive;
 	}
 
 	/**
 	 * Open (creating on demand) the project database for one working
-	 * directory, run migrations, and mark rows left `running` by a previous
-	 * process as `interrupted`. Branch names, base SHAs, output excerpts, and
-	 * review findings survive interruption untouched so `resume` can requeue.
+	 * directory and run migrations. Opening never mutates run rows: recovery
+	 * from a dead owner happens per run inside {@link claimRun}, so
+	 * status/read-only opens can never disturb a run owned by a live process.
 	 */
 	static openForCwd(cwd: string, options: ParallelWorkflowStoreOptions = {}): ParallelWorkflowStore {
 		const resolvedCwd = path.resolve(cwd);
@@ -382,6 +434,8 @@ export class ParallelWorkflowStore {
 		fs.mkdirSync(stateDir, { recursive: true });
 		const databasePath = path.join(stateDir, `${parallelProjectKey(repoRoot)}.sqlite`);
 		const now = options.now ?? Date.now;
+		const ownerPid = options.ownerPid ?? process.pid;
+		const processAlive = options.isProcessAlive ?? defaultProcessAlive;
 
 		const db = new Database(databasePath, { create: true });
 		try {
@@ -390,8 +444,7 @@ export class ParallelWorkflowStore {
 			db.exec("PRAGMA foreign_keys = ON");
 			db.exec(`PRAGMA busy_timeout = ${PARALLEL_STORE_BUSY_TIMEOUT_MS}`);
 			migrate(db);
-			const store = new ParallelWorkflowStore(resolvedCwd, repoRoot, databasePath, db, now);
-			store.markInterrupted();
+			const store = new ParallelWorkflowStore(resolvedCwd, repoRoot, databasePath, db, now, ownerPid, processAlive);
 			return store;
 		} catch (error) {
 			db.close();
@@ -609,6 +662,65 @@ export class ParallelWorkflowStore {
 		);
 	}
 
+	/**
+	 * Atomically claim exclusive ownership of one run for this store
+	 * instance. Claiming is reentrant for the current owner. A run owned by
+	 * a live foreign process is rejected. Any fresh claim — takeover from a
+	 * dead owner or a legacy/unowned run — first marks only that run's
+	 * mid-flight rows `interrupted` (a live driver would hold the lease), so
+	 * branch artifacts survive for `resume`.
+	 */
+	claimRun(runId: string): void {
+		const timestamp = this.now();
+		this.db.transaction(() => {
+			const row = this.db
+				.query("SELECT owner_token, owner_pid FROM workflow_runs WHERE run_id = $runId")
+				.get({ $runId: runId }) as { owner_token: string | null; owner_pid: number | null } | null;
+			if (row === null) throw storeError(`run "${runId}" not found`);
+			if (row.owner_token === this.ownerToken) return;
+			if (row.owner_token !== null) {
+				const pid = typeof row.owner_pid === "number" ? row.owner_pid : null;
+				if (pid !== null && this.processAlive(pid)) {
+					throw storeError(`run "${runId}" is claimed by live process ${pid}`);
+				}
+			}
+			this.markRunInterrupted(runId, timestamp);
+			this.db
+				.query(
+					`UPDATE workflow_runs SET owner_token = $token, owner_pid = $pid, owner_claimed_at = $timestamp
+					 WHERE run_id = $runId`,
+				)
+				.run({ $token: this.ownerToken, $pid: this.ownerPid, $timestamp: timestamp, $runId: runId });
+		})();
+	}
+
+	/** Release one run's lease; a no-op unless this instance is the owner. */
+	releaseRun(runId: string): void {
+		this.db
+			.query(
+				`UPDATE workflow_runs SET owner_token = NULL, owner_pid = NULL, owner_claimed_at = NULL
+				 WHERE run_id = $runId AND owner_token = $token`,
+			)
+			.run({ $runId: runId, $token: this.ownerToken });
+	}
+
+	/** Current persisted lease for one run, or null when the run is unknown. */
+	runOwnership(runId: string): ParallelRunOwnership | null {
+		const row = this.db
+			.query("SELECT owner_token, owner_pid, owner_claimed_at FROM workflow_runs WHERE run_id = $runId")
+			.get({ $runId: runId }) as {
+			owner_token: string | null;
+			owner_pid: number | null;
+			owner_claimed_at: number | null;
+		} | null;
+		if (row === null) return null;
+		return {
+			ownerToken: asNullableString(row.owner_token),
+			ownerPid: typeof row.owner_pid === "number" ? row.owner_pid : null,
+			claimedAt: typeof row.owner_claimed_at === "number" ? row.owner_claimed_at : null,
+		};
+	}
+
 	close(): void {
 		this.db.close();
 	}
@@ -628,24 +740,26 @@ export class ParallelWorkflowStore {
 		if (result.changes === 0) throw storeError(`${label} "${runId}" not found`);
 	}
 
-	/** Mark rows abandoned mid-flight by a dead process; artifacts survive. */
-	private markInterrupted(): void {
-		const timestamp = this.now();
-		this.db.transaction(() => {
-			this.db
-				.query(
-					"UPDATE workflow_reviews SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'",
-				)
-				.run({ $timestamp: timestamp });
-			this.db
-				.query(
-					"UPDATE workflow_shards SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'",
-				)
-				.run({ $timestamp: timestamp });
-			this.db
-				.query("UPDATE workflow_runs SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'")
-				.run({ $timestamp: timestamp });
-		})();
+	/** Mark one run's rows abandoned mid-flight by a dead owner; artifacts survive. */
+	private markRunInterrupted(runId: string, timestamp: number): void {
+		this.db
+			.query(
+				`UPDATE workflow_reviews SET status = 'interrupted', updated_at = $timestamp
+				 WHERE run_id = $runId AND status = 'running'`,
+			)
+			.run({ $runId: runId, $timestamp: timestamp });
+		this.db
+			.query(
+				`UPDATE workflow_shards SET status = 'interrupted', updated_at = $timestamp
+				 WHERE run_id = $runId AND status = 'running'`,
+			)
+			.run({ $runId: runId, $timestamp: timestamp });
+		this.db
+			.query(
+				`UPDATE workflow_runs SET status = 'interrupted', updated_at = $timestamp
+				 WHERE run_id = $runId AND status IN ('running', 'integrating')`,
+			)
+			.run({ $runId: runId, $timestamp: timestamp });
 	}
 
 	private parseRunRow(row: RunRow): ParallelRunRecord {
@@ -684,13 +798,17 @@ function migrate(db: Database): void {
 	const row = db.query("PRAGMA user_version").get() as { user_version?: unknown } | null;
 	const version = Number(row?.user_version ?? 0);
 	if (version === PARALLEL_STORE_SCHEMA_VERSION) return;
-	if (version !== 0) {
+	if (version !== 0 && version !== 1) {
 		throw storeError(
 			`unknown schema version ${version}; this build supports version ${PARALLEL_STORE_SCHEMA_VERSION}`,
 		);
 	}
 	db.transaction(() => {
-		for (const statement of SCHEMA_STATEMENTS) db.exec(statement);
+		if (version === 0) {
+			for (const statement of SCHEMA_STATEMENTS) db.exec(statement);
+		} else {
+			for (const statement of SCHEMA_V2_MIGRATION_STATEMENTS) db.exec(statement);
+		}
 		db.exec(`PRAGMA user_version = ${PARALLEL_STORE_SCHEMA_VERSION}`);
 	})();
 }

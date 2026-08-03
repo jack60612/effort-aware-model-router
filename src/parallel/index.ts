@@ -56,6 +56,7 @@ export {
 	type ParallelSubagentRequest,
 	type ParallelSubagentResult,
 	type ParallelSubagentRunner,
+	parallelPatchTouchedPaths,
 	parseParallelReviewVerdict,
 } from "./coordinator";
 export {

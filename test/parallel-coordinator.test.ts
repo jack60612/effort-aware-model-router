@@ -13,6 +13,7 @@ import {
 	type ParallelCoordinatorStore,
 	type ParallelSubagentRequest,
 	type ParallelSubagentResult,
+	parallelPatchTouchedPaths,
 	parseParallelReviewVerdict,
 } from "../src/parallel/coordinator";
 import { type ParallelWorkflowPlan, validateParallelWorkflowManifest } from "../src/parallel/index";
@@ -34,6 +35,7 @@ interface ShardInput {
 	id: string;
 	agent?: string;
 	dependsOn?: string[];
+	owns?: string[];
 	review?: { agent: string; required: boolean };
 }
 
@@ -52,7 +54,7 @@ function makePlan(
 				kind: "implementation",
 				agent: shard.agent ?? "task",
 				prompt: `Implement shard ${shard.id}.`,
-				owns: [`src/${shard.id}.ts`],
+				owns: shard.owns ?? [`src/${shard.id}.ts`],
 				produces: [],
 				requires: [],
 				dependsOn: shard.dependsOn ?? [],
@@ -69,6 +71,9 @@ class FakeStore implements ParallelCoordinatorStore {
 		string,
 		{ record: ParallelStoredRun["run"]; shards: ParallelShardRecord[]; reviews: ParallelReviewRecord[] }
 	>();
+	readonly leaseLog: string[] = [];
+	claimError: Error | null = null;
+	private readonly claimed = new Set<string>();
 
 	createRun(input: ParallelCreateRunInput): ParallelStoredRun {
 		if (this.runs.has(input.runId)) throw new Error(`run "${input.runId}" already exists`);
@@ -166,6 +171,18 @@ class FakeStore implements ParallelCoordinatorStore {
 		if (patch.findings !== undefined) review.findings = [...patch.findings];
 		if (patch.error !== undefined) review.error = patch.error;
 	}
+
+	claimRun(runId: string): void {
+		if (!this.runs.has(runId)) throw new Error(`run "${runId}" not found`);
+		if (this.claimError !== null) throw this.claimError;
+		this.claimed.add(runId);
+		this.leaseLog.push(`claim:${runId}`);
+	}
+
+	releaseRun(runId: string): void {
+		this.claimed.delete(runId);
+		this.leaseLog.push(`release:${runId}`);
+	}
 }
 
 function makeAgent(name: string, tools: string[]): AgentDefinition {
@@ -188,6 +205,14 @@ interface HarnessOptions {
 	currentModelSelector?: string;
 	/** Use the coordinator's built-in review worktree seam instead of the fake. */
 	defaultReviewWorktree?: boolean;
+	/** Host exec seam override; the default succeeds for every command. */
+	exec?: (command: string, args: string[]) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+	/** Changed-path seam; the default reports no changes so ownership passes. */
+	captureChangedPaths?: ParallelCoordinatorDependencies["captureChangedPaths"];
+	/** Dependency materializer; the default records a `dep:` event per branch. */
+	materializeDependencyBranches?: ParallelCoordinatorDependencies["materializeDependencyBranches"];
+	/** Use the coordinator's built-in git-merge materializer instead of the fake. */
+	defaultMaterializer?: boolean;
 }
 
 function okResult(output: string): ParallelSubagentResult {
@@ -215,7 +240,7 @@ function makeHarness(options: HarnessOptions = {}) {
 		...(options.currentModelSelector === undefined ? {} : { currentModelSelector: options.currentModelSelector }),
 		exec: async (command, args) => {
 			execCalls.push({ command, args: [...args] });
-			return { stdout: "", stderr: "", exitCode: 0 };
+			return options.exec === undefined ? { stdout: "", stderr: "", exitCode: 0 } : options.exec(command, args);
 		},
 		discover: async () => ({ agents }),
 		runSubagent: async request => {
@@ -238,7 +263,10 @@ function makeHarness(options: HarnessOptions = {}) {
 		createRunId: () => `run-${++runCounter}`,
 		isReadOnly: agent => (agent.tools ?? []).every(tool => tool === "read" || tool === "grep"),
 		getRepoRoot: async () => REPO_ROOT,
-		captureBaseline: async () => BASELINE,
+		captureBaseline: async repoRoot => {
+			events.push(`baseline:${repoRoot}`);
+			return { root: { ...BASELINE.root, repoRoot }, nested: [] };
+		},
 		ensureIsolation: async (_baseCwd, id): Promise<IsolationHandle> => {
 			events.push(`ensure:${id}`);
 			return {
@@ -266,6 +294,16 @@ function makeHarness(options: HarnessOptions = {}) {
 		cleanupTaskBranches: async (_repoRoot, branches) => {
 			events.push(`prune:${branches.join(",")}`);
 		},
+		captureChangedPaths: options.captureChangedPaths ?? (async () => []),
+		...(options.defaultMaterializer === true
+			? {}
+			: {
+					materializeDependencyBranches:
+						options.materializeDependencyBranches ??
+						(async (worktreeDir: string, branchNames: readonly string[]) => {
+							for (const branchName of branchNames) events.push(`dep:${branchName}:${worktreeDir}`);
+						}),
+				}),
 		...(options.defaultReviewWorktree === true
 			? {}
 			: {
@@ -394,11 +432,17 @@ describe("parallel coordinator dispatch", () => {
 		// Isolation is torn down for both the success and the failure.
 		expect(harness.events).toContain("cleanup:/iso/run-1-good");
 		expect(harness.events).toContain("cleanup:/iso/run-1-boom");
-		// Commit ordering: ensure -> run -> commit -> cleanup for the success.
+		// Commit ordering: ensure -> baseline -> run -> commit -> cleanup for the success.
 		const sequence = harness.events.filter(
 			event => event.endsWith("run-1-good") || event === "cleanup:/iso/run-1-good",
 		);
-		expect(sequence).toEqual(["ensure:run-1-good", "run:run-1-good", "commit:run-1-good", "cleanup:/iso/run-1-good"]);
+		expect(sequence).toEqual([
+			"ensure:run-1-good",
+			"baseline:/iso/run-1-good",
+			"run:run-1-good",
+			"commit:run-1-good",
+			"cleanup:/iso/run-1-good",
+		]);
 	});
 
 	it("blocks dependents of a failed shard and fails the run", async () => {
@@ -737,5 +781,297 @@ describe("parallel coordinator guards", () => {
 		expect(waited).toBe(true);
 		expect(snapshot.run.status).toBe("ready_to_integrate");
 		await resumePromise;
+	});
+});
+
+describe("parallel coordinator dependency materialization", () => {
+	it("materializes transitive dependency branches in the isolated worktree before capturing the baseline", async () => {
+		const baselines: WorktreeBaseline[] = [];
+		const harness = makeHarness({
+			commitToBranch: async (_dir, baseline, taskId): Promise<CommitToBranchResult> => {
+				baselines.push(baseline);
+				return { branchName: `task/${taskId}`, baseSha: `base-${taskId}`, nestedPatches: [] };
+			},
+		});
+		const plan = makePlan([{ id: "a" }, { id: "b", dependsOn: ["a"] }, { id: "c", dependsOn: ["b"] }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+		expect(snapshot.run.status).toBe("ready_to_integrate");
+
+		// b sees a's branch; c sees the transitive closure in manifest order.
+		expect(harness.events.filter(event => event.startsWith("dep:") && event.endsWith(":/iso/run-1-b"))).toEqual([
+			"dep:task/run-1-a:/iso/run-1-b",
+		]);
+		expect(harness.events.filter(event => event.startsWith("dep:") && event.endsWith(":/iso/run-1-c"))).toEqual([
+			"dep:task/run-1-a:/iso/run-1-c",
+			"dep:task/run-1-b:/iso/run-1-c",
+		]);
+		// Per-shard ordering: ensure -> materialize -> baseline -> run.
+		const bEvents = harness.events.filter(event => event.includes("run-1-b"));
+		expect(bEvents.indexOf("dep:task/run-1-a:/iso/run-1-b")).toBeGreaterThan(bEvents.indexOf("ensure:run-1-b"));
+		expect(bEvents.indexOf("baseline:/iso/run-1-b")).toBeGreaterThan(
+			bEvents.indexOf("dep:task/run-1-a:/iso/run-1-b"),
+		);
+		expect(bEvents.indexOf("run:run-1-b")).toBeGreaterThan(bEvents.indexOf("baseline:/iso/run-1-b"));
+		// The baseline handed to the commit helper is normalized back to the
+		// real repository so the task branch lands there, not in the isolation.
+		expect(baselines).toHaveLength(3);
+		for (const baseline of baselines) expect(baseline.root.repoRoot).toBe(REPO_ROOT);
+	});
+
+	it("treats a dependency that produced no branch as a no-op", async () => {
+		const harness = makeHarness({
+			commitToBranch: async (_dir, _baseline, taskId): Promise<CommitToBranchResult | null> =>
+				taskId === "run-1-a"
+					? null
+					: { branchName: `task/${taskId}`, baseSha: `base-${taskId}`, nestedPatches: [] },
+		});
+		const plan = makePlan([{ id: "a" }, { id: "b", dependsOn: ["a"] }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+		expect(snapshot.run.status).toBe("ready_to_integrate");
+		expect(snapshot.shards.find(shard => shard.shardId === "b")?.status).toBe("completed");
+		expect(harness.events.some(event => event.startsWith("dep:"))).toBe(false);
+	});
+
+	it("the default materializer merges --no-commit --no-ff and a failure fails the shard clearly", async () => {
+		const harness = makeHarness({
+			defaultMaterializer: true,
+			exec: async (_command, args) =>
+				args.includes("merge")
+					? { stdout: "", stderr: "merge exploded", exitCode: 1 }
+					: { stdout: "", stderr: "", exitCode: 0 },
+		});
+		const plan = makePlan([{ id: "a" }, { id: "b", dependsOn: ["a"] }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+
+		const merge = harness.execCalls.find(call => call.args.includes("merge"));
+		expect(merge?.command).toBe("git");
+		expect(merge?.args).toEqual(["-C", "/iso/run-1-b", "merge", "--no-commit", "--no-ff", "task/run-1-a"]);
+
+		const failed = snapshot.shards.find(shard => shard.shardId === "b");
+		expect(failed?.status).toBe("failed");
+		expect(failed?.error).toContain('failed to materialize dependency "a" (task/run-1-a) for shard "b"');
+		expect(failed?.error).toContain("merge exploded");
+		expect(snapshot.shards.find(shard => shard.shardId === "a")?.status).toBe("completed");
+		expect(snapshot.run.status).toBe("failed");
+		// Isolation for the failed shard was still torn down.
+		expect(harness.events).toContain("cleanup:/iso/run-1-b");
+	});
+	it("merges all dependency branches in one concluded merge", async () => {
+		let mergeInProgress = false;
+		const mergeCalls: string[] = [];
+		let quitCalls = 0;
+		const harness = makeHarness({
+			defaultMaterializer: true,
+			exec: async (_command, args) => {
+				if (args.includes("--quit")) {
+					quitCalls += 1;
+					mergeInProgress = false;
+					return { stdout: "", stderr: "", exitCode: 0 };
+				}
+				if (args.includes("merge")) {
+					const noFastForward = args.indexOf("--no-ff");
+					mergeCalls.push(args.slice(noFastForward + 1).join(","));
+					if (mergeInProgress) {
+						return { stdout: "", stderr: "MERGE_HEAD exists", exitCode: 1 };
+					}
+					mergeInProgress = true;
+					return { stdout: "", stderr: "", exitCode: 0 };
+				}
+				return { stdout: "", stderr: "", exitCode: 0 };
+			},
+		});
+		const plan = makePlan([{ id: "a" }, { id: "b", dependsOn: ["a"] }, { id: "c", dependsOn: ["b"] }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+
+		expect(snapshot.run.status).toBe("ready_to_integrate");
+		expect(snapshot.shards.every(shard => shard.status === "completed")).toBe(true);
+		expect(mergeCalls).toEqual(["task/run-1-a", "task/run-1-a,task/run-1-b"]);
+		expect(quitCalls).toBe(2);
+	});
+});
+
+describe("parallel coordinator ownership enforcement", () => {
+	it("rejects out-of-scope changes without creating a task branch", async () => {
+		const harness = makeHarness({
+			captureChangedPaths: async () => ["src/a.ts", "src/evil.ts", "./src/evil.ts"],
+		});
+		const plan = makePlan([{ id: "a" }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+
+		const shard = snapshot.shards[0];
+		expect(shard?.status).toBe("failed");
+		expect(shard?.error).toBe('shard "a" changed paths outside its owns list: src/evil.ts');
+		expect(shard?.branchName).toBeNull();
+		expect(snapshot.run.status).toBe("failed");
+		// No task branch commit was attempted; isolation still cleaned up.
+		expect(harness.events.some(event => event.startsWith("commit:"))).toBe(false);
+		expect(harness.events).toContain("cleanup:/iso/run-1-a");
+	});
+
+	it("accepts changes under an owned directory prefix", async () => {
+		const harness = makeHarness({
+			captureChangedPaths: async () => ["src/mod/deep/file.ts", "./src/mod/other.ts"],
+		});
+		const plan = makePlan([{ id: "a", owns: ["src/mod"] }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+		expect(snapshot.shards[0]?.status).toBe("completed");
+		expect(snapshot.shards[0]?.branchName).toBe("task/run-1-a");
+		expect(snapshot.run.status).toBe("ready_to_integrate");
+	});
+
+	it("parallelPatchTouchedPaths reads modify, add, delete, rename, and quoted binary headers", () => {
+		const patch = [
+			"diff --git a/src/mod.ts b/src/mod.ts",
+			"index 1111111..2222222 100644",
+			"--- a/src/mod.ts",
+			"+++ b/src/mod.ts",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"diff --git a/src/new.ts b/src/new.ts",
+			"new file mode 100644",
+			"--- /dev/null",
+			"+++ b/src/new.ts",
+			"@@ -0,0 +1 @@",
+			"+created",
+			"diff --git a/src/old.ts b/src/old.ts",
+			"deleted file mode 100644",
+			"--- a/src/old.ts",
+			"+++ /dev/null",
+			"@@ -1 +0,0 @@",
+			"-gone",
+			"diff --git a/src/from.ts b/src/to.ts",
+			"similarity index 100%",
+			"rename from src/from.ts",
+			"rename to src/to.ts",
+			'diff --git "a/src/spa ce.ts" "b/src/spa ce.ts"',
+			'Binary files "a/src/spa ce.ts" and "b/src/spa ce.ts" differ',
+		].join("\n");
+		expect(parallelPatchTouchedPaths(patch)).toEqual([
+			"src/from.ts",
+			"src/mod.ts",
+			"src/new.ts",
+			"src/old.ts",
+			"src/spa ce.ts",
+			"src/to.ts",
+		]);
+	});
+});
+
+describe("parallel coordinator run leases", () => {
+	it("wraps resume, review, integrate, and idle cancel in a claim/release pair", async () => {
+		const harness = makeHarness({
+			runSubagent: async request => (request.id.endsWith("-review") ? okResult(REVIEW_OK) : okResult("did work")),
+		});
+		const plan = makePlan([{ id: "a" }]);
+		const created = await harness.coordinator.createRun(plan);
+		const runId = created.run.runId;
+		expect(harness.store.leaseLog).toEqual([]);
+
+		await harness.coordinator.resume(runId);
+		expect(harness.store.leaseLog).toEqual([`claim:${runId}`, `release:${runId}`]);
+
+		await harness.coordinator.review(runId);
+		await harness.coordinator.integrate(runId);
+		await harness.coordinator.cancel(runId);
+		expect(harness.store.leaseLog).toEqual([
+			`claim:${runId}`,
+			`release:${runId}`,
+			`claim:${runId}`,
+			`release:${runId}`,
+			`claim:${runId}`,
+			`release:${runId}`,
+			`claim:${runId}`,
+			`release:${runId}`,
+		]);
+	});
+
+	it("overlapping local operations share one claim and cancel never releases a held lease", async () => {
+		let releaseRunner!: () => void;
+		const runnerGate = new Promise<void>(resolve => {
+			releaseRunner = resolve;
+		});
+		let started: (() => void) | null = null;
+		const startedPromise = new Promise<void>(resolve => {
+			started = resolve;
+		});
+		const harness = makeHarness({
+			runSubagent: async request => {
+				started?.();
+				await runnerGate;
+				return okResult(`done:${request.id}`);
+			},
+		});
+		const plan = makePlan([{ id: "a" }]);
+		const created = await harness.coordinator.createRun(plan);
+		const runId = created.run.runId;
+		const resumePromise = harness.coordinator.resume(runId);
+		await startedPromise;
+		expect(harness.store.leaseLog).toEqual([`claim:${runId}`]);
+
+		// cancel piggybacks on the lease resume still holds: no extra claim,
+		// and no release until the last local holder settles.
+		const cancelled = await harness.coordinator.cancel(runId);
+		expect(cancelled.run.status).toBe("cancelled");
+		expect(harness.store.leaseLog).toEqual([`claim:${runId}`]);
+
+		releaseRunner();
+		await resumePromise;
+		await harness.coordinator.wait(runId);
+		expect(harness.store.leaseLog).toEqual([`claim:${runId}`, `release:${runId}`]);
+	});
+
+	it("a claim rejected by a live foreign owner fails the operation before any dispatch", async () => {
+		const harness = makeHarness();
+		const plan = makePlan([{ id: "a" }]);
+		const created = await harness.coordinator.createRun(plan);
+		harness.store.claimError = new Error('run "run-1" is claimed by live process 4242');
+		await expect(harness.coordinator.resume(created.run.runId)).rejects.toThrow("claimed by live process 4242");
+		expect(harness.requests).toHaveLength(0);
+		// The rejected claim never produced a spurious release.
+		expect(harness.store.leaseLog).toEqual([]);
+
+		harness.store.claimError = null;
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+		expect(snapshot.run.status).toBe("ready_to_integrate");
+		expect(harness.store.leaseLog).toEqual([`claim:${created.run.runId}`, `release:${created.run.runId}`]);
+	});
+});
+
+describe("parallel coordinator repeated integrate", () => {
+	it("reuses the exact in-flight integration promise and clears the slot on settle", async () => {
+		let releaseMerge!: () => void;
+		const mergeGate = new Promise<void>(resolve => {
+			releaseMerge = resolve;
+		});
+		let mergeCalls = 0;
+		const harness = makeHarness({
+			mergeTaskBranches: async (_repoRoot, branches) => {
+				mergeCalls += 1;
+				await mergeGate;
+				return { merged: branches.map(branch => branch.branchName), failed: [] };
+			},
+		});
+		const plan = makePlan([{ id: "a" }]);
+		const created = await harness.coordinator.createRun(plan);
+		await harness.coordinator.resume(created.run.runId);
+
+		const first = harness.coordinator.integrate(created.run.runId);
+		const second = harness.coordinator.integrate(created.run.runId);
+		expect(second).toBe(first);
+
+		releaseMerge();
+		const snapshot = await first;
+		expect(snapshot.run.status).toBe("integrated");
+		expect(mergeCalls).toBe(1);
+		// Settled slot cleared: the next call is a fresh attempt, rejected
+		// because the run is already integrated rather than silently reused.
+		await expect(harness.coordinator.integrate(created.run.runId)).rejects.toThrow("already integrated");
 	});
 });

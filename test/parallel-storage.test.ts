@@ -65,7 +65,9 @@ let projectDir: string;
 let stateDir: string;
 let stores: ParallelWorkflowStore[];
 
-function openStore(options: { now?: () => number } = {}): ParallelWorkflowStore {
+function openStore(
+	options: { now?: () => number; ownerPid?: number; isProcessAlive?: (pid: number) => boolean } = {},
+): ParallelWorkflowStore {
 	const store = ParallelWorkflowStore.openForCwd(projectDir, { stateDir, ...options });
 	stores.push(store);
 	return store;
@@ -391,8 +393,8 @@ describe("bounded and defensive values", () => {
 	});
 });
 
-describe("interrupted recovery", () => {
-	it("marks running runs, shards, and reviews interrupted on open without touching artifacts", () => {
+describe("run ownership leases", () => {
+	it("opening the store never mutates running rows", () => {
 		const store = openStore();
 		store.createRun({ runId: "run-1", plan: makePlan() });
 		store.updateRun("run-1", { status: "running" });
@@ -402,36 +404,172 @@ describe("interrupted recovery", () => {
 			baseSha: "deadbeef",
 			outputExcerpt: "partial output",
 		});
-		store.updateReview("run-1", "delegation-config", {
-			status: "running",
-			findings: [{ path: "src/config.ts", message: "in flight" }],
-		});
+		store.updateReview("run-1", "delegation-config", { status: "running" });
 		store.close();
 
+		// A status/read-only open leaves every mid-flight row untouched.
 		const reopened = openStore();
 		const stored = reopened.getRun("run-1");
-		expect(stored?.run.status).toBe("interrupted");
+		expect(stored?.run.status).toBe("running");
 		const shard = stored?.shards.find(entry => entry.shardId === "delegation-config");
-		expect(shard?.status).toBe("interrupted");
+		expect(shard?.status).toBe("running");
 		expect(shard?.branchName).toBe("task/delegation-config");
-		expect(shard?.baseSha).toBe("deadbeef");
-		expect(shard?.outputExcerpt).toBe("partial output");
-		expect(stored?.reviews[0]?.status).toBe("interrupted");
-		expect(stored?.reviews[0]?.findings).toEqual([{ path: "src/config.ts", message: "in flight" }]);
+		expect(stored?.reviews[0]?.status).toBe("running");
 	});
 
-	it("leaves non-running statuses untouched on open", () => {
-		const store = openStore();
-		store.createRun({ runId: "run-1", plan: makePlan() });
-		store.updateRun("run-1", { status: "review_pending" });
-		store.updateShard("run-1", "delegation-config", { status: "completed" });
-		store.updateShard("run-1", "consumer", { status: "failed", error: "boom" });
-		store.close();
+	it("claims an idle run reentrantly and releases only for the current owner", () => {
+		const first = openStore({ isProcessAlive: () => true });
+		first.createRun({ runId: "run-1", plan: makePlan() });
+		first.claimRun("run-1");
+		first.claimRun("run-1");
+		expect(first.runOwnership("run-1")?.ownerToken).toBe(first.ownerToken);
 
-		const reopened = openStore();
-		const stored = reopened.getRun("run-1");
-		expect(stored?.run.status).toBe("review_pending");
-		expect(stored?.shards.map(shard => shard.status)).toEqual(["completed", "failed"]);
-		expect(stored?.reviews[0]?.status).toBe("pending");
+		const second = openStore({ isProcessAlive: () => true });
+		expect(() => second.claimRun("run-1")).toThrow(/claimed by live process/);
+		// A non-owner release is a no-op; the lease survives.
+		second.releaseRun("run-1");
+		expect(first.runOwnership("run-1")?.ownerToken).toBe(first.ownerToken);
+
+		first.releaseRun("run-1");
+		expect(first.runOwnership("run-1")?.ownerToken).toBeNull();
+		second.claimRun("run-1");
+		expect(second.runOwnership("run-1")?.ownerToken).toBe(second.ownerToken);
+	});
+
+	it("claimRun throws for unknown runs", () => {
+		const store = openStore();
+		expect(() => store.claimRun("missing")).toThrow(/not found/);
+	});
+
+	it("takeover from a dead owner marks only that run's mid-flight rows interrupted", () => {
+		const dying = openStore({ ownerPid: 424_242 });
+		for (const [runId, name] of [
+			["run-1", "first-run"],
+			["run-2", "second-run"],
+		] as const) {
+			dying.createRun({ runId, plan: makePlan(name) });
+			dying.claimRun(runId);
+			dying.updateRun(runId, { status: "running" });
+			dying.updateShard(runId, "delegation-config", {
+				status: "running",
+				branchName: "task/keep",
+				baseSha: "deadbeef",
+				outputExcerpt: "partial output",
+			});
+			dying.updateReview(runId, "delegation-config", {
+				status: "running",
+				findings: [{ path: "src/config.ts", message: "in flight" }],
+			});
+		}
+		dying.close();
+
+		const survivor = openStore({ isProcessAlive: () => false });
+		survivor.claimRun("run-1");
+
+		const taken = survivor.getRun("run-1");
+		expect(taken?.run.status).toBe("interrupted");
+		const shard = taken?.shards.find(entry => entry.shardId === "delegation-config");
+		expect(shard?.status).toBe("interrupted");
+		// Branch artifacts survive takeover untouched so `resume` can requeue.
+		expect(shard?.branchName).toBe("task/keep");
+		expect(shard?.baseSha).toBe("deadbeef");
+		expect(shard?.outputExcerpt).toBe("partial output");
+		expect(taken?.reviews[0]?.status).toBe("interrupted");
+		expect(taken?.reviews[0]?.findings).toEqual([{ path: "src/config.ts", message: "in flight" }]);
+		expect(survivor.runOwnership("run-1")?.ownerToken).toBe(survivor.ownerToken);
+
+		// The sibling run keeps its rows and its dead owner's lease.
+		const untouched = survivor.getRun("run-2");
+		expect(untouched?.run.status).toBe("running");
+		expect(untouched?.shards.find(entry => entry.shardId === "delegation-config")?.status).toBe("running");
+		expect(untouched?.reviews[0]?.status).toBe("running");
+		expect(survivor.runOwnership("run-2")?.ownerPid).toBe(424_242);
+	});
+
+	it("a fresh claim recovers unowned stale running and integrating rows", () => {
+		// Legacy shape: rows left running/integrating with no owner recorded
+		// (schema-v1 crash). A live driver would hold the lease, so a fresh
+		// claim treats them as abandoned and recovers them.
+		const before = openStore();
+		before.createRun({ runId: "run-1", plan: makePlan() });
+		before.updateRun("run-1", { status: "integrating" });
+		before.updateShard("run-1", "delegation-config", { status: "running" });
+		before.close();
+
+		const store = openStore({ isProcessAlive: () => true });
+		store.claimRun("run-1");
+		const stored = store.getRun("run-1");
+		expect(stored?.run.status).toBe("interrupted");
+		expect(stored?.shards.find(entry => entry.shardId === "delegation-config")?.status).toBe("interrupted");
+	});
+});
+
+describe("schema migration", () => {
+	it("upgrades a version-1 database in place and preserves existing rows", async () => {
+		await fs.mkdir(stateDir, { recursive: true });
+		const databasePath = path.join(stateDir, `${parallelProjectKey(path.resolve(projectDir))}.sqlite`);
+		const raw = new Database(databasePath, { create: true });
+		raw.exec(
+			`CREATE TABLE workflow_runs (
+				run_id TEXT PRIMARY KEY,
+				cwd TEXT NOT NULL,
+				repo_root TEXT NOT NULL,
+				plan_hash TEXT NOT NULL,
+				plan_json TEXT NOT NULL,
+				source_path TEXT NOT NULL,
+				base_sha TEXT,
+				status TEXT NOT NULL,
+				last_error TEXT,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL
+			)`,
+		);
+		raw.exec(
+			`CREATE TABLE workflow_shards (
+				run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+				shard_id TEXT NOT NULL,
+				position INTEGER NOT NULL,
+				status TEXT NOT NULL,
+				branch_name TEXT,
+				base_sha TEXT,
+				output_excerpt TEXT,
+				error TEXT,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				PRIMARY KEY (run_id, shard_id)
+			)`,
+		);
+		raw.exec(
+			`CREATE TABLE workflow_reviews (
+				run_id TEXT NOT NULL,
+				shard_id TEXT NOT NULL,
+				position INTEGER NOT NULL,
+				agent TEXT NOT NULL,
+				status TEXT NOT NULL,
+				summary TEXT,
+				findings_json TEXT NOT NULL DEFAULT '[]',
+				error TEXT,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				PRIMARY KEY (run_id, shard_id),
+				FOREIGN KEY (run_id, shard_id) REFERENCES workflow_shards(run_id, shard_id) ON DELETE CASCADE
+			)`,
+		);
+		raw.exec(
+			`INSERT INTO workflow_runs (run_id, cwd, repo_root, plan_hash, plan_json, source_path, base_sha, status, last_error, created_at, updated_at)
+			 VALUES ('legacy', '/p', '/p', 'hash', '{"run":"legacy-run"}', 'm.yml', NULL, 'planned', NULL, 1, 1)`,
+		);
+		raw.exec("PRAGMA user_version = 1");
+		raw.close();
+
+		const store = openStore();
+		expect(store.connectionSettings().userVersion).toBe(PARALLEL_STORE_SCHEMA_VERSION);
+		const runs = store.listRuns();
+		expect(runs.map(run => run.runId)).toEqual(["legacy"]);
+		expect(runs[0]?.runName).toBe("legacy-run");
+		// The migrated row starts idle and is claimable under the new lease.
+		expect(store.runOwnership("legacy")).toEqual({ ownerToken: null, ownerPid: null, claimedAt: null });
+		store.claimRun("legacy");
+		expect(store.runOwnership("legacy")?.ownerToken).toBe(store.ownerToken);
 	});
 });
