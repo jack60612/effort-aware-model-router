@@ -214,7 +214,7 @@ export function parseRouterConfigLayer(value: unknown): RouterConfigLayer {
 		) {
 			delegation.plannerTimeoutMs = inputDelegation.plannerTimeoutMs;
 		}
-		if (hasOwn(inputDelegation, "agents")) {
+		if (hasOwn(inputDelegation, "agents") && Array.isArray(inputDelegation.agents)) {
 			const agents = cleanSelectors(inputDelegation.agents);
 			if (agents !== undefined) delegation.agents = agents;
 		}

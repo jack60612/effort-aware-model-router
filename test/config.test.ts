@@ -325,6 +325,7 @@ describe("parseRouterConfigLayer", () => {
 	it("rejects empty agent lists and out-of-bounds planner timeouts", () => {
 		expect(parseRouterConfigLayer({ delegation: { agents: [] } })).toEqual({ delegation: {} });
 		expect(parseRouterConfigLayer({ delegation: { agents: ["", "  ", 42] } })).toEqual({ delegation: {} });
+		expect(parseRouterConfigLayer({ delegation: { agents: "scout" } })).toEqual({ delegation: {} });
 
 		for (const plannerTimeoutMs of [0, -1, 1.5, 120_001, Number.NaN, Number.POSITIVE_INFINITY]) {
 			expect(parseRouterConfigLayer({ delegation: { plannerTimeoutMs } })).toEqual({ delegation: {} });
