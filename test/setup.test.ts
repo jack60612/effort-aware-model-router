@@ -18,6 +18,12 @@ const config: RouterConfig = {
 	classifierMinPromptChars: 0,
 	classifierCooldownMs: 0,
 	thinkingProfiles: {},
+	delegation: {
+		enabled: false,
+		plannerTimeoutMs: 20_000,
+		agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+		measurement: { enabled: false, sampleRate: 0.1 },
+	},
 };
 
 function values(overrides: Partial<RouterSetupValues> = {}): RouterSetupValues {
@@ -28,6 +34,11 @@ function values(overrides: Partial<RouterSetupValues> = {}): RouterSetupValues {
 		classifierMinPromptChars: 4,
 		classifierCooldownMs: 500,
 		thinkingProfiles: { "mock/low": { default: "low", xhigh: "medium" } },
+		delegation: {
+			enabled: true,
+			plannerTimeoutMs: 20_000,
+			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+		},
 		...overrides,
 	};
 }
@@ -36,6 +47,7 @@ class FakeUI {
 	readonly selected: string[] = [];
 	readonly entered: string[] = [];
 	readonly confirmed: boolean[] = [];
+	readonly confirmTitles: string[] = [];
 	readonly notifications: string[] = [];
 	readonly selectTitles: string[] = [];
 	readonly selectOptions: string[][] = [];
@@ -58,7 +70,8 @@ class FakeUI {
 		return this.inputs.shift();
 	}
 
-	async confirm(): Promise<boolean> {
+	async confirm(title: string): Promise<boolean> {
+		this.confirmTitles.push(title);
 		return this.confirmations.shift() ?? false;
 	}
 
@@ -146,6 +159,29 @@ describe("writeRouterConfigLayer", () => {
 		await expect(writeRouterConfigLayer(file, values())).rejects.toThrow();
 		expect(await fs.readFile(file, "utf8")).toBe(original);
 	});
+
+	it("replaces owned delegation keys while preserving extra delegation data", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				unrelated: { keep: true },
+				delegation: { enabled: false, plannerTimeoutMs: 45_000, agents: ["scout"], note: "keep" },
+			}),
+		);
+
+		await writeRouterConfigLayer(file, values());
+		const written = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+
+		expect(written.unrelated).toEqual({ keep: true });
+		expect(written.delegation).toEqual({
+			enabled: true,
+			plannerTimeoutMs: 20_000,
+			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+			note: "keep",
+		});
+	});
 });
 
 describe("runRouterSetup", () => {
@@ -166,7 +202,7 @@ describe("runRouterSetup", () => {
 				"inherit",
 			],
 			["4"],
-			[true, false, false, true],
+			[true, false, false, false, true],
 		);
 		const result = await runRouterSetup(setupContext(ui), config);
 
@@ -195,7 +231,7 @@ describe("runRouterSetup", () => {
 		const ui = new FakeUI(
 			["project", "enabled", "Keep current — 2.5 seconds", "@tiny", "done", "none"],
 			["0"],
-			[false, true],
+			[false, false, true],
 		);
 		const result = await runRouterSetup(setupContext(ui), { ...config, classifierCooldownMs: 2_500 });
 
@@ -225,7 +261,7 @@ describe("runRouterSetup", () => {
 		const ui = new FakeUI(
 			["project", "enabled", "No wait — classify every eligible prompt", "@tiny", "done", "none"],
 			["0"],
-			[false, false],
+			[false, false, false],
 		);
 
 		const result = await runRouterSetup(setupContext(ui), config);
@@ -236,5 +272,93 @@ describe("runRouterSetup", () => {
 
 	it("exposes all configurable route effort names to the wizard contract", () => {
 		expect(ROUTER_EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max"]);
+	});
+
+	it("asks whether to enable delegation and writes the delegation block", async () => {
+		const ui = new FakeUI(
+			["project", "enabled", "No wait — classify every eligible prompt", "@tiny", "done", "none"],
+			["0"],
+			[false, true, true],
+		);
+
+		const result = await runRouterSetup(setupContext(ui), config);
+
+		expect(result.status).toBe("written");
+		expect(ui.confirmTitles).toContain("Enable self-contained subagent delegation?");
+		const written = JSON.parse(await fs.readFile(path.join(cwd, ".omp", "model-router.json"), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(written.delegation).toEqual({
+			enabled: true,
+			plannerTimeoutMs: 20_000,
+			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+		});
+	});
+
+	it("changes only delegation.enabled while advanced values and unrelated JSON survive", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, JSON.stringify({ unrelated: { keep: true }, delegation: { note: "keep" } }));
+		const ui = new FakeUI(
+			["project", "enabled", "No wait — classify every eligible prompt", "@tiny", "done", "none"],
+			["0"],
+			[false, true, true],
+		);
+		const advanced: RouterConfig = {
+			...config,
+			delegation: {
+				enabled: false,
+				plannerTimeoutMs: 45_000,
+				agents: ["scout"],
+				measurement: { enabled: false, sampleRate: 0.1 },
+			},
+		};
+
+		const result = await runRouterSetup(setupContext(ui), advanced);
+
+		expect(result.status).toBe("written");
+		const written = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		expect(written.unrelated).toEqual({ keep: true });
+		expect(written.delegation).toEqual({
+			enabled: true,
+			plannerTimeoutMs: 45_000,
+			agents: ["scout"],
+			note: "keep",
+		});
+	});
+
+	it("preserves an existing nested delegation.measurement object unchanged", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				delegation: {
+					enabled: false,
+					plannerTimeoutMs: 45_000,
+					agents: ["scout"],
+					measurement: { enabled: true, sampleRate: 0.5 },
+					note: "keep",
+				},
+			}),
+		);
+		const ui = new FakeUI(
+			["project", "enabled", "No wait — classify every eligible prompt", "@tiny", "done", "none"],
+			["0"],
+			[false, true, true],
+		);
+
+		const result = await runRouterSetup(setupContext(ui), config);
+
+		expect(result.status).toBe("written");
+		const written = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		expect(written.delegation).toEqual({
+			enabled: true,
+			plannerTimeoutMs: 20_000,
+			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+			measurement: { enabled: true, sampleRate: 0.5 },
+			note: "keep",
+		});
 	});
 });

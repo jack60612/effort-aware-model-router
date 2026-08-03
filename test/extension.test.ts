@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model, Usage } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -7,8 +7,21 @@ import type {
 	InputEvent,
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent";
-import type { RouteEffort, RouterConfig } from "../src/config";
-import { createModelRouterExtension } from "../src/extension";
+import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { Text } from "@oh-my-pi/pi-tui";
+import type { RouteEffort, RouterConfig, RouterDelegationConfig } from "../src/config";
+import type {
+	DelegationAgentOption,
+	DelegationPlan,
+	DelegationPlannerConfig,
+	DelegationPlannerContext,
+} from "../src/delegation";
+import {
+	createModelRouterExtension,
+	MODEL_ROUTER_DELEGATION_ENTRY,
+	MODEL_ROUTER_DELEGATION_MESSAGE,
+} from "../src/extension";
 import type { RouterSetupContext } from "../src/setup";
 import {
 	createRouterState,
@@ -60,9 +73,149 @@ function routerConfig(overrides: Partial<RouterConfig> = {}): RouterConfig {
 		classifierMinPromptChars: 0,
 		classifierCooldownMs: 0,
 		thinkingProfiles: {},
+		delegation: {
+			enabled: false,
+			plannerTimeoutMs: 5_000,
+			agents: ["scout", "task"],
+			measurement: { enabled: false, sampleRate: 0.1 },
+		},
 		...overrides,
 	};
 }
+
+function delegationConfig(
+	delegation: Partial<RouterDelegationConfig> = {},
+	base: Partial<RouterConfig> = {},
+): RouterConfig {
+	return routerConfig({
+		...base,
+		delegation: {
+			enabled: true,
+			plannerTimeoutMs: 5_000,
+			agents: ["scout", "task"],
+			measurement: { enabled: false, sampleRate: 0.1 },
+			...delegation,
+		},
+	});
+}
+
+/** Delegation disabled, shadow measurement armed: the sampled main-path configuration. */
+function measurementConfig(sampleRate = 0.5, base: Partial<RouterConfig> = {}): RouterConfig {
+	return routerConfig({
+		...base,
+		delegation: {
+			enabled: false,
+			plannerTimeoutMs: 5_000,
+			agents: ["scout", "task"],
+			measurement: { enabled: true, sampleRate },
+		},
+	});
+}
+
+function agentDefinition(name: string, description: string): AgentDefinition {
+	return { name, description, systemPrompt: `${name} system prompt`, source: "project" };
+}
+
+function singleResult(overrides: Partial<SingleResult> = {}): SingleResult {
+	return {
+		index: 0,
+		id: "delegation-run",
+		agent: "scout",
+		agentSource: "project",
+		task: "standalone task",
+		exitCode: 0,
+		output: "delegated output",
+		stderr: "",
+		truncated: false,
+		durationMs: 5,
+		tokens: 1,
+		requests: 1,
+		...overrides,
+	};
+}
+
+const pngImage: ImageContent = { type: "image", data: "aGk=", mimeType: "image/png" };
+
+const plannerProviderUsage: Usage = {
+	input: 120,
+	output: 34,
+	cacheRead: 56,
+	cacheWrite: 7,
+	totalTokens: 217,
+	cost: { input: 0.12, output: 0.34, cacheRead: 0.056, cacheWrite: 0.007, total: 0.523 },
+};
+const plannerUsageSnapshot = {
+	input: 120,
+	output: 34,
+	cacheRead: 56,
+	cacheWrite: 7,
+	totalTokens: 217,
+	cost: 0.523,
+};
+const childProviderUsage: Usage = {
+	input: 40,
+	output: 10,
+	cacheRead: 5,
+	cacheWrite: 2,
+	totalTokens: 57,
+	cost: { input: 0.04, output: 0.1, cacheRead: 0.005, cacheWrite: 0.002, total: 0.147 },
+};
+const childUsageSnapshot = {
+	input: 40,
+	output: 10,
+	cacheRead: 5,
+	cacheWrite: 2,
+	totalTokens: 57,
+	cost: 0.147,
+};
+
+function parentAssistantUsage(input: number, output: number, costTotal: number): Usage {
+	return {
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: input + output,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: costTotal },
+	};
+}
+
+function assistantEndMessage(usage: Usage): Record<string, unknown> {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "assistant reply" }],
+		api: "openai-responses",
+		provider: "mock",
+		model: "base",
+		usage,
+		stopReason: "stop",
+		timestamp: 1,
+	};
+}
+
+function userEndMessage(text: string): Record<string, unknown> {
+	return { role: "user", content: text, timestamp: 1 };
+}
+
+type PlanCall = {
+	promptText: string;
+	model: Model;
+	agents: readonly DelegationAgentOption[];
+	repositoryIndex: string;
+	config: DelegationPlannerConfig;
+	ctx: DelegationPlannerContext;
+};
+type PlanOutcome = DelegationPlan | Error | ((call: PlanCall) => Promise<DelegationPlan>);
+type ExecuteOutcome = SingleResult | Error | ((options: ExecutorOptions) => Promise<SingleResult>);
+type SentUserMessage = { content: unknown; deliverAs: string | undefined };
+type SentCustomMessage = {
+	customType: string | undefined;
+	content: unknown;
+	display: boolean | undefined;
+	details: unknown;
+	triggerTurn: boolean | undefined;
+};
+type CapturedRenderer = (message: unknown, options: unknown, theme: unknown) => unknown;
 
 class Harness {
 	readonly handlers = new Map<string, EventHandler>();
@@ -85,10 +238,27 @@ class Harness {
 	setModelResults: Array<boolean | Error> = [];
 	config = routerConfig();
 	now = 1_000;
+	/** Deterministic sample source; defaults to rejecting every shadow sample. */
+	randomValue = 0.999;
 	loadCount = 0;
 	setupCalls = 0;
 	setupContexts: RouterSetupContext[] = [];
-	classifications: Array<RouteEffort | Error> = ["low"];
+	classifications: Array<RouteEffort | Error | (() => Promise<RouteEffort>)> = ["low"];
+	readonly renderers = new Map<string, CapturedRenderer>();
+	readonly userMessages: SentUserMessage[] = [];
+	readonly customMessages: SentCustomMessage[] = [];
+	readonly sequence: string[] = [];
+	readonly planCalls: PlanCall[] = [];
+	planResults: PlanOutcome[] = [];
+	readonly discoverCalls: string[] = [];
+	discoveredAgents: AgentDefinition[] = [
+		agentDefinition("scout", "read-only recon"),
+		agentDefinition("task", "general worker"),
+		agentDefinition("rogue", "not allowlisted"),
+	];
+	readonly executeCalls: ExecutorOptions[] = [];
+	executeResults: ExecuteOutcome[] = [];
+	agentIndex = "repository index text";
 
 	readonly selectors = new Map<string, TestModel>([
 		["@smol", smol],
@@ -121,6 +291,7 @@ class Harness {
 			},
 			async setModel(selected: Model): Promise<boolean> {
 				self.setModelCalls.push(selected);
+				self.sequence.push(`setModel:${selected.id}`);
 				const result = self.setModelResults.shift() ?? true;
 				if (result instanceof Error) throw result;
 				if (result) self.current = selected as TestModel;
@@ -128,6 +299,23 @@ class Harness {
 			},
 			setThinkingLevel(level: string): void {
 				self.thinkingCalls.push(level);
+			},
+			registerMessageRenderer(customType: string, renderer: CapturedRenderer): void {
+				self.renderers.set(customType, renderer);
+			},
+			sendMessage(message: Record<string, unknown>, options?: { triggerTurn?: boolean }): void {
+				self.sequence.push("sendMessage");
+				self.customMessages.push({
+					customType: message.customType as string | undefined,
+					content: message.content,
+					display: message.display as boolean | undefined,
+					details: message.details,
+					triggerTurn: options?.triggerTurn,
+				});
+			},
+			sendUserMessage(content: unknown, options?: { deliverAs?: string }): void {
+				self.sequence.push("sendUserMessage");
+				self.userMessages.push({ content, deliverAs: options?.deliverAs });
 			},
 			logger: { warn(): void {}, debug(): void {}, error(): void {}, info(): void {} },
 		} as unknown as ExtensionAPI;
@@ -185,6 +373,7 @@ class Harness {
 				this.classifierPrompts.push(prompt);
 				const next = this.classifications.shift() ?? "low";
 				if (next instanceof Error) throw next;
+				if (typeof next === "function") return next();
 				return next;
 			},
 			now: () => this.now,
@@ -193,6 +382,37 @@ class Harness {
 				this.setupContexts.push(context);
 				return { status: "written", path: "/project/.omp/model-router.json" };
 			},
+			plan: async (promptText, model, agents, repositoryIndex, config, ctx) => {
+				const call: PlanCall = { promptText, model, agents, repositoryIndex, config, ctx };
+				this.sequence.push("plan");
+				this.planCalls.push(call);
+				const next = this.planResults.shift() ?? { delegate: false, reason: "default pass-through" };
+				if (next instanceof Error) throw next;
+				if (typeof next === "function") return next(call);
+				return next;
+			},
+			discover: async (cwd: string) => {
+				this.discoverCalls.push(cwd);
+				return { agents: [...this.discoveredAgents], projectAgentsDir: null };
+			},
+			execute: async options => {
+				this.sequence.push("execute");
+				this.executeCalls.push(options);
+				const next = this.executeResults.shift();
+				if (next === undefined) {
+					return singleResult({
+						index: options.index,
+						id: options.id,
+						agent: options.agent.name,
+						task: options.task,
+					});
+				}
+				if (next instanceof Error) throw next;
+				if (typeof next === "function") return next(options);
+				return next;
+			},
+			loadAgentIndex: async () => this.agentIndex,
+			random: () => this.randomValue,
 		})(this.api);
 	}
 
@@ -200,10 +420,49 @@ class Harness {
 		await this.handlers.get(name)?.({ type: name }, this.ctx);
 	}
 
-	async input(text: string, source: InputEvent["source"] = "interactive"): Promise<InputEventResult | undefined> {
-		return (await this.handlers.get("input")?.({ type: "input", text, source }, this.ctx)) as
+	async input(
+		text: string,
+		source: InputEvent["source"] = "interactive",
+		images?: ImageContent[],
+	): Promise<InputEventResult | undefined> {
+		return (await this.handlers.get("input")?.({ type: "input", text, source, images }, this.ctx)) as
 			| InputEventResult
 			| undefined;
+	}
+
+	async shutdown(): Promise<void> {
+		await this.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, this.ctx);
+	}
+
+	async messageEnd(message: Record<string, unknown>): Promise<void> {
+		await this.handlers.get("message_end")?.({ type: "message_end", message }, this.ctx);
+	}
+
+	async agentEnd(willContinue: boolean, messages: unknown[] = []): Promise<void> {
+		await this.handlers.get("agent_end")?.({ type: "agent_end", messages, willContinue }, this.ctx);
+	}
+
+	/** Flush microtask turns until the fire-and-forget pipeline reaches the observable state. */
+	async settle(predicate: () => boolean): Promise<void> {
+		for (let turn = 0; turn < 1_000; turn += 1) {
+			if (predicate()) return;
+			await Promise.resolve();
+		}
+		throw new Error("delegation workflow did not settle");
+	}
+
+	delegationEntries(): Array<Record<string, unknown>> {
+		return this.entries
+			.filter(entry => entry.customType === MODEL_ROUTER_DELEGATION_ENTRY)
+			.map(entry => entry.data as Record<string, unknown>);
+	}
+
+	shadowEntries(): Array<Record<string, unknown>> {
+		return this.delegationEntries().filter(entry => entry.status === "shadow");
+	}
+
+	measuredEntries(): Array<Record<string, unknown>> {
+		return this.delegationEntries().filter(entry => entry.status === "measured");
 	}
 
 	async command(args: string): Promise<void> {
@@ -228,8 +487,11 @@ describe("model router extension", () => {
 	it("registers public lifecycle/input handlers and the route command", () => {
 		const harness = new Harness();
 		expect([...harness.handlers.keys()].sort()).toEqual([
+			"agent_end",
 			"input",
+			"message_end",
 			"session_branch",
+			"session_shutdown",
 			"session_start",
 			"session_switch",
 			"session_tree",
@@ -369,7 +631,19 @@ describe("model router extension", () => {
 		await harness.lifecycle();
 		const values = (prefix: string): string[] => harness.complete(prefix)?.map(item => item.value) ?? [];
 
-		expect(values("")).toEqual(["auto", "manual", "off", "status", "explain", "history", "once", "setup", "reload"]);
+		expect(values("")).toEqual([
+			"auto",
+			"manual",
+			"off",
+			"status",
+			"explain",
+			"history",
+			"once",
+			"cancel",
+			"setup",
+			"reload",
+		]);
+		expect(values("can")).toEqual(["cancel"]);
 		expect(values("set")).toEqual(["setup"]);
 		expect(values("manual ")).toContain("manual @tiny");
 		expect(values("once @t")).toContain("once @tiny");
@@ -668,5 +942,727 @@ describe("model router extension", () => {
 		await harness.lifecycle();
 		expect(harness.state().version).toBe(2);
 		expect(harness.state().history).toEqual([]);
+	});
+});
+
+describe("model router delegation", () => {
+	function deferredEffort(): { classify: () => Promise<RouteEffort>; resolve: (effort: RouteEffort) => void } {
+		const { promise, resolve } = Promise.withResolvers<RouteEffort>();
+		return { classify: () => promise, resolve };
+	}
+
+	function abortablePlan(call: PlanCall): Promise<DelegationPlan> {
+		const { promise, reject } = Promise.withResolvers<DelegationPlan>();
+		call.ctx.signal?.addEventListener("abort", () => reject(call.ctx.signal?.reason ?? new Error("aborted")));
+		return promise;
+	}
+
+	function abortableExecute(options: ExecutorOptions): Promise<SingleResult> {
+		const { promise, reject } = Promise.withResolvers<SingleResult>();
+		options.signal?.addEventListener("abort", () => reject(options.signal?.reason ?? new Error("aborted")));
+		return promise;
+	}
+
+	async function enabledHarness(): Promise<Harness> {
+		const harness = new Harness();
+		harness.config = delegationConfig();
+		await harness.lifecycle();
+		return harness;
+	}
+
+	async function successfulDelegation(): Promise<Harness> {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		harness.executeResults = [singleResult({ output: "child output text" })];
+		expect(await harness.input("summarize the repository layout")).toEqual({ handled: true });
+		await harness.settle(() => harness.customMessages.length === 1);
+		return harness;
+	}
+
+	it("keeps slash commands and queued prefixes outside delegation", async () => {
+		const harness = await enabledHarness();
+		for (const text of ["/usage", "/route status", "-> shell command", "=> python snippet"]) {
+			expect(await harness.input(text)).toBeUndefined();
+		}
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
+	});
+
+	it("keeps image, short, and non-interactive input on the main path", async () => {
+		const harness = new Harness();
+		harness.config = delegationConfig({}, { classifierMinPromptChars: 8 });
+		await harness.lifecycle();
+		expect(await harness.input("describe this screenshot", "interactive", [pngImage])).toBeUndefined();
+		expect(await harness.input("short")).toBeUndefined();
+		expect(await harness.input("a long enough remote request", "rpc")).toBeUndefined();
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
+	});
+
+	it("keeps input on the main path when delegation is disabled or routing is manual or off", async () => {
+		const disabled = new Harness();
+		disabled.config = routerConfig();
+		await disabled.lifecycle();
+		expect(await disabled.input("an eligible standalone request")).toBeUndefined();
+		expect(disabled.planCalls).toEqual([]);
+
+		const pinned = await enabledHarness();
+		await pinned.command("manual");
+		expect(await pinned.input("an eligible standalone request")).toBeUndefined();
+		await pinned.command("off");
+		expect(await pinned.input("another eligible standalone request")).toBeUndefined();
+		expect(pinned.planCalls).toEqual([]);
+		expect(pinned.delegationEntries()).toEqual([]);
+	});
+
+	it("keeps later input on the main path while a workflow is active", async () => {
+		const harness = await enabledHarness();
+		const deferred = deferredEffort();
+		harness.classifications = [deferred.classify, "low"];
+		harness.planResults = [{ delegate: false, reason: "needs context" }];
+		expect(await harness.input("first self-contained request")).toEqual({ handled: true });
+		const second = harness.input("second request during workflow");
+		expect(harness.delegationEntries()).toHaveLength(1);
+		deferred.resolve("low");
+		expect(await second).toBeUndefined();
+		expect(harness.delegationEntries().filter(entry => entry.status === "pending")).toHaveLength(1);
+		await harness.settle(() => harness.userMessages.length === 1);
+		expect(harness.planCalls).toHaveLength(1);
+	});
+
+	it("serializes detached delegation routing against later main-path routing", async () => {
+		const harness = await enabledHarness();
+		const deferred = deferredEffort();
+		harness.classifications = [deferred.classify, "high"];
+		harness.planResults = [{ delegate: false, reason: "needs context" }];
+		expect(await harness.input("first self-contained request")).toEqual({ handled: true });
+		await harness.settle(() => harness.classifierPrompts.length === 1);
+
+		let secondSettled = false;
+		const second = harness.input("second concurrent request").then(result => {
+			secondSettled = true;
+			return result;
+		});
+		for (let turn = 0; turn < 50; turn += 1) await Promise.resolve();
+		expect(secondSettled).toBe(false);
+		expect(harness.classifierPrompts).toEqual(["first self-contained request"]);
+		expect(harness.setModelCalls).toEqual([]);
+
+		deferred.resolve("low");
+		expect(await second).toBeUndefined();
+		expect(harness.classifierPrompts).toEqual(["first self-contained request", "second concurrent request"]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["smol", "slow"]);
+		expect(harness.current?.id).toBe("slow");
+		await harness.settle(() => harness.userMessages.length === 1);
+	});
+
+	it("treats a child-reported abort without user cancellation as a guarded failure", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		harness.executeResults = [
+			singleResult({ aborted: true, abortReason: "wall clock exceeded", exitCode: 1, output: "" }),
+		];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+
+		expect(harness.customMessages[0]?.content).toContain("wall clock exceeded");
+		expect(harness.userMessages[0]?.deliverAs).toBe("followUp");
+		expect(harness.userMessages[0]?.content).toContain("the original standalone request");
+		expect(harness.userMessages[0]?.content).toContain("side effects");
+		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+	});
+
+	it("answers status and early input safely before any lifecycle event", async () => {
+		const harness = new Harness();
+		await harness.command("status");
+		expect(harness.notifications.at(-1)?.message).toContain("delegation off");
+		expect(await harness.input("an early eligible standalone request")).toBeUndefined();
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
+	});
+
+	it("claims eligible input immediately with a pending entry before classification resolves", async () => {
+		const harness = await enabledHarness();
+		const deferred = deferredEffort();
+		harness.classifications = [deferred.classify];
+		harness.planResults = [{ delegate: false, reason: "needs context" }];
+		const result = await harness.input("please summarize the repository layout");
+		expect(result).toEqual({ handled: true });
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.executeCalls).toEqual([]);
+		expect(harness.delegationEntries()).toMatchObject([
+			{ status: "pending", request: "please summarize the repository layout" },
+		]);
+		deferred.resolve("low");
+		await harness.settle(() => harness.userMessages.length === 1);
+	});
+
+	it("routes first and hands the selected model and allowlisted discovered agents to the planner", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: false, reason: "needs context" }];
+		await harness.input("an eligible standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+
+		expect(harness.planCalls).toHaveLength(1);
+		const call = harness.planCalls[0];
+		expect(call?.model.id).toBe("smol");
+		expect(harness.sequence.indexOf("setModel:smol")).toBeLessThan(harness.sequence.indexOf("plan"));
+		expect(call?.promptText).toBe("an eligible standalone request");
+		expect(call?.agents.map(agent => agent.name)).toEqual(["scout", "task"]);
+		expect(call?.repositoryIndex).toBe("repository index text");
+		expect(call?.config.plannerTimeoutMs).toBe(5_000);
+		expect(call?.ctx.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("replays a malformed or timed-out plan as an ordered follow-up after clearing ownership", async () => {
+		for (const failure of [
+			new Error("model-router: unparseable delegation plan"),
+			new Error("model-router: delegation planner aborted: request aborted"),
+		]) {
+			const harness = await enabledHarness();
+			harness.classifications = ["low", "low"];
+			harness.planResults = [failure, { delegate: false, reason: "second workflow" }];
+			expect(await harness.input("the original standalone request")).toEqual({ handled: true });
+			await harness.settle(() => harness.userMessages.length === 1);
+
+			expect(harness.userMessages[0]).toEqual({
+				content: "the original standalone request",
+				deliverAs: "followUp",
+			});
+			expect(harness.executeCalls).toEqual([]);
+			expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+			expect(harness.planCalls).toHaveLength(1);
+
+			expect(await harness.input("a new standalone request")).toEqual({ handled: true });
+			await harness.settle(() => harness.userMessages.length === 2);
+			expect(harness.planCalls).toHaveLength(2);
+		}
+	});
+
+	it("bounds planner failure diagnostics so raw payloads never reach state entries", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [new Error(`model-router: unparseable delegation plan: "${"x".repeat(2_000)}"`)];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+
+		const failed = harness.delegationEntries().at(-1);
+		expect(failed).toMatchObject({ status: "failed" });
+		expect(String(failed?.reason).length).toBeLessThanOrEqual(201);
+	});
+
+	it("replays missing-agent and non-delegated plans without executing", async () => {
+		const missingAgent = await enabledHarness();
+		missingAgent.classifications = ["low"];
+		missingAgent.planResults = [{ delegate: true, agent: "ghost", task: "haunt the repo" }];
+		await missingAgent.input("an eligible standalone request");
+		await missingAgent.settle(() => missingAgent.userMessages.length === 1);
+		expect(missingAgent.userMessages[0]).toEqual({
+			content: "an eligible standalone request",
+			deliverAs: "followUp",
+		});
+		expect(missingAgent.executeCalls).toEqual([]);
+		expect(missingAgent.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+
+		const passedThrough = await enabledHarness();
+		passedThrough.classifications = ["low"];
+		passedThrough.planResults = [{ delegate: false, reason: "needs prior context" }];
+		await passedThrough.input("a conversational follow-up request");
+		await passedThrough.settle(() => passedThrough.userMessages.length === 1);
+		expect(passedThrough.userMessages[0]).toEqual({
+			content: "a conversational follow-up request",
+			deliverAs: "followUp",
+		});
+		expect(passedThrough.executeCalls).toEqual([]);
+		expect(passedThrough.delegationEntries().at(-1)).toMatchObject({ status: "passed-through" });
+	});
+
+	it("executes a valid plan through the public executor contract", async () => {
+		const harness = await successfulDelegation();
+		expect(harness.executeCalls).toHaveLength(1);
+		const call = harness.executeCalls[0];
+		expect(call?.agent).toBe(harness.discoveredAgents[0] as AgentDefinition);
+		expect(call?.task).toBe("standalone task assignment");
+		expect(call?.modelOverride).toBe("mock/smol");
+		const thinkingLevel: string | undefined = call?.thinkingLevel;
+		expect(thinkingLevel).toBe("low");
+		expect(call?.cwd).toBe("/project");
+		expect(typeof call?.id).toBe("string");
+		expect(call?.id.length).toBeGreaterThan(0);
+		expect(typeof call?.index).toBe("number");
+		expect(call?.signal).toBeInstanceOf(AbortSignal);
+		expect(call?.keepAlive).toBe(false);
+	});
+
+	it("renders success visibly without a main turn or replay", async () => {
+		const harness = await successfulDelegation();
+		expect(harness.customMessages[0]).toMatchObject({
+			customType: MODEL_ROUTER_DELEGATION_MESSAGE,
+			display: true,
+			triggerTurn: false,
+		});
+		expect(harness.customMessages[0]?.content).toContain("child output text");
+		expect(harness.customMessages[0]?.content).toContain("summarize the repository layout");
+		expect(harness.customMessages[0]?.details).toMatchObject({ agent: "scout" });
+		expect(harness.userMessages).toEqual([]);
+		expect(harness.delegationEntries().map(entry => entry.status)).toEqual(["pending", "delegated", "completed"]);
+	});
+
+	it("renders child failure then replays a guarded follow-up", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		harness.executeResults = [singleResult({ exitCode: 1, error: "child exploded", output: "" })];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+
+		const sends = harness.sequence.filter(step => step === "sendMessage" || step === "sendUserMessage");
+		expect(sends).toEqual(["sendMessage", "sendUserMessage"]);
+		expect(harness.customMessages[0]).toMatchObject({
+			customType: MODEL_ROUTER_DELEGATION_MESSAGE,
+			display: true,
+			triggerTurn: false,
+		});
+		expect(harness.customMessages[0]?.content).toContain("child exploded");
+		expect(harness.userMessages[0]?.deliverAs).toBe("followUp");
+		expect(harness.userMessages[0]?.content).toContain("the original standalone request");
+		expect(harness.userMessages[0]?.content).toContain("side effects");
+		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+	});
+
+	it("treats a throwing child as a guarded failure", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "task", task: "standalone task assignment" }];
+		harness.executeResults = [new Error("spawn failed")];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+
+		expect(harness.customMessages[0]?.content).toContain("spawn failed");
+		expect(harness.userMessages[0]?.content).toContain("side effects");
+		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+	});
+
+	it("cancels during planning via /route cancel without replay", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [abortablePlan];
+		expect(await harness.input("a long standalone request")).toEqual({ handled: true });
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.command("cancel");
+		await harness.settle(() => harness.delegationEntries().some(entry => entry.status === "cancelled"));
+		expect(harness.userMessages).toEqual([]);
+		expect(harness.executeCalls).toEqual([]);
+
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: false, reason: "later" }];
+		expect(await harness.input("a fresh standalone request")).toEqual({ handled: true });
+		await harness.settle(() => harness.userMessages.length === 1);
+	});
+
+	it("cancels during execution via /route cancel without replay or failure render", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		harness.executeResults = [abortableExecute];
+		await harness.input("a long standalone request");
+		await harness.settle(() => harness.executeCalls.length === 1);
+
+		await harness.command("cancel");
+		await harness.settle(() => harness.delegationEntries().some(entry => entry.status === "cancelled"));
+		expect(harness.userMessages).toEqual([]);
+		expect(harness.customMessages).toEqual([]);
+	});
+
+	it("aborts the active workflow on session shutdown without replay", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [abortablePlan];
+		await harness.input("a long standalone request");
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.shutdown();
+		await harness.settle(() => harness.delegationEntries().some(entry => entry.status === "cancelled"));
+		expect(harness.userMessages).toEqual([]);
+		expect(harness.executeCalls).toEqual([]);
+	});
+
+	it("invalidates an in-flight planner workflow on session switch without successor entries or replay", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		const deferred = Promise.withResolvers<DelegationPlan>();
+		harness.planResults = [() => deferred.promise];
+		expect(await harness.input("the original standalone request")).toEqual({ handled: true });
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.lifecycle("session_switch");
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: false, reason: "successor decline" }];
+		expect(await harness.input("a fresh standalone request")).toEqual({ handled: true });
+		deferred.resolve({ delegate: false, reason: "stale decline" });
+		await harness.settle(() => harness.userMessages.length === 1);
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+
+		expect(harness.userMessages).toEqual([{ content: "a fresh standalone request", deliverAs: "followUp" }]);
+		expect(harness.customMessages).toEqual([]);
+		expect(harness.delegationEntries().map(entry => [entry.status, entry.request])).toEqual([
+			["pending", "the original standalone request"],
+			["pending", "a fresh standalone request"],
+			["passed-through", "a fresh standalone request"],
+		]);
+
+		await harness.messageEnd(userEndMessage("the original standalone request"));
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(8, 4, 0.5)));
+		await harness.agentEnd(false);
+		expect(harness.measuredEntries()).toEqual([]);
+	});
+
+	it("suppresses a stale child result after session switch: no entry, no message, no replay", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		const deferredResult = Promise.withResolvers<SingleResult>();
+		harness.executeResults = [() => deferredResult.promise];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.executeCalls.length === 1);
+		const entriesBefore = harness.delegationEntries().length;
+
+		await harness.lifecycle("session_switch");
+		deferredResult.resolve(singleResult({ exitCode: 1, error: "child exploded late", output: "" }));
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+
+		expect(harness.delegationEntries()).toHaveLength(entriesBefore);
+		expect(harness.customMessages).toEqual([]);
+		expect(harness.userMessages).toEqual([]);
+	});
+
+	it("reports no active workflow for /route cancel when idle", async () => {
+		const harness = await enabledHarness();
+		await harness.command("cancel");
+		expect(harness.notifications.at(-1)?.message).toContain("no active delegation");
+		expect(harness.delegationEntries()).toEqual([]);
+	});
+
+	it("returns the status bar to delegation idle after a workflow settles so cancel matches reality", async () => {
+		const harness = await successfulDelegation();
+		await harness.settle(() => harness.statuses.at(-1)?.includes("(idle)") === true);
+		expect(harness.statuses.at(-1)).toContain("delegation on (idle)");
+
+		await harness.command("cancel");
+		expect(harness.notifications.at(-1)?.message).toContain("no active delegation");
+		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "completed" });
+	});
+
+	it("reports delegation and workflow state in /route status", async () => {
+		const disabled = new Harness();
+		disabled.config = routerConfig();
+		await disabled.lifecycle();
+		await disabled.command("status");
+		expect(disabled.notifications.at(-1)?.message).toContain("delegation off");
+
+		const harness = await enabledHarness();
+		await harness.command("status");
+		expect(harness.notifications.at(-1)?.message).toContain("delegation on");
+		expect(harness.notifications.at(-1)?.message).toContain("idle");
+
+		harness.classifications = ["low"];
+		harness.planResults = [abortablePlan];
+		await harness.input("a long standalone request");
+		await harness.settle(() => harness.planCalls.length === 1);
+		await harness.command("status");
+		expect(harness.notifications.at(-1)?.message).toContain("active");
+		await harness.command("cancel");
+		await harness.settle(() => harness.delegationEntries().some(entry => entry.status === "cancelled"));
+	});
+
+	it("registers a Text renderer preserving the plain string content", () => {
+		const harness = new Harness();
+		const renderer = harness.renderers.get(MODEL_ROUTER_DELEGATION_MESSAGE);
+		expect(renderer).toBeDefined();
+		const component = renderer?.(
+			{
+				role: "custom",
+				customType: MODEL_ROUTER_DELEGATION_MESSAGE,
+				content: "delegated result body",
+				display: true,
+				timestamp: 1,
+			},
+			{ expanded: false },
+			{},
+		);
+		expect(component).toBeInstanceOf(Text);
+		expect((component as Text).getText()).toBe("delegated result body");
+	});
+});
+
+describe("model router measurement", () => {
+	function abortableShadowPlan(call: PlanCall): Promise<DelegationPlan> {
+		const { promise, reject } = Promise.withResolvers<DelegationPlan>();
+		call.ctx.signal?.addEventListener("abort", () => reject(call.ctx.signal?.reason ?? new Error("aborted")));
+		return promise;
+	}
+
+	async function sampledHarness(sampleRate = 0.5, randomValue = 0.25): Promise<Harness> {
+		const harness = new Harness();
+		harness.config = measurementConfig(sampleRate);
+		harness.randomValue = randomValue;
+		await harness.lifecycle();
+		return harness;
+	}
+
+	it("starts a sampled main-path planner shadow without executor or message calls", async () => {
+		const harness = await sampledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [
+			{ delegate: true, agent: "scout", task: "shadow standalone task", usage: plannerProviderUsage },
+		];
+		expect(await harness.input("please summarize the repository layout")).toBeUndefined();
+		await harness.settle(() => harness.shadowEntries().length === 1);
+
+		expect(harness.planCalls).toHaveLength(1);
+		expect(harness.planCalls[0]?.model.id).toBe("smol");
+		expect(harness.planCalls[0]?.promptText).toBe("please summarize the repository layout");
+		expect(harness.executeCalls).toEqual([]);
+		expect(harness.userMessages).toEqual([]);
+		expect(harness.customMessages).toEqual([]);
+		const entry = harness.shadowEntries()[0];
+		expect(entry).toMatchObject({
+			status: "shadow",
+			outcome: "delegate",
+			model: "mock/smol",
+			parentContextTokens: 100,
+			sampleRate: 0.5,
+			agent: "scout",
+			taskChars: "shadow standalone task".length,
+			plannerUsage: plannerUsageSnapshot,
+		});
+		expect(entry?.task).toBeUndefined();
+		expect(entry?.request).toBeUndefined();
+	});
+
+	it("makes no planner call when the sample is rejected", async () => {
+		const harness = await sampledHarness(0.5, 0.9);
+		harness.classifications = ["low"];
+		expect(await harness.input("please summarize the repository layout")).toBeUndefined();
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["smol"]);
+	});
+
+	it("records a skip without planning when no discovered agent is allowlisted", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.discoveredAgents = [agentDefinition("rogue", "not allowlisted")];
+		harness.classifications = ["low"];
+		await harness.input("please summarize the repository layout");
+		await harness.settle(() => harness.shadowEntries().length === 1);
+
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.shadowEntries()[0]).toMatchObject({
+			status: "shadow",
+			outcome: "skipped",
+			reason: "no eligible agents",
+		});
+	});
+
+	it("skips a second sampled prompt while a shadow is active without a provider call", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low", "low"];
+		harness.planResults = [abortableShadowPlan];
+		await harness.input("the first sampled standalone prompt");
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.input("the second sampled standalone prompt");
+		await harness.settle(() => harness.shadowEntries().some(entry => entry.outcome === "skipped"));
+		expect(harness.planCalls).toHaveLength(1);
+		expect(harness.shadowEntries().at(-1)).toMatchObject({
+			status: "shadow",
+			outcome: "skipped",
+			reason: "shadow active",
+		});
+		await harness.shutdown();
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+		expect(harness.shadowEntries()).toHaveLength(1);
+		expect(harness.shadowEntries().some(entry => entry.outcome === "cancelled")).toBe(false);
+	});
+
+	it("suppresses a stale shadow's appends after a session reset while later shadows still record", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low", "low"];
+		const deferred = Promise.withResolvers<DelegationPlan>();
+		harness.planResults = [() => deferred.promise, { delegate: false, reason: "successor decline" }];
+		await harness.input("the original sampled standalone prompt");
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.lifecycle("session_switch");
+		const entriesBeforeResolve = harness.delegationEntries().length;
+		deferred.resolve({ delegate: true, agent: "scout", task: "stale task" });
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+		expect(harness.delegationEntries()).toHaveLength(entriesBeforeResolve);
+		expect(harness.shadowEntries()).toEqual([]);
+		expect(harness.measuredEntries()).toEqual([]);
+
+		await harness.input("a fresh prompt in the successor session");
+		await harness.settle(() => harness.shadowEntries().length === 1);
+		expect(harness.shadowEntries()[0]).toMatchObject({
+			status: "shadow",
+			outcome: "decline",
+			runId: "model-router-shadow-2",
+		});
+	});
+
+	it("keeps raw planner excerpts out of persisted shadow failure metadata", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low"];
+		harness.planResults = [
+			new Error('model-router: unparseable delegation plan: "LEAKED_PLANNER_EXCERPT refactor the payments module"'),
+		];
+		await harness.input("please summarize the repository layout");
+		await harness.settle(() => harness.shadowEntries().length === 1);
+
+		expect(harness.shadowEntries()[0]).toMatchObject({ status: "shadow", outcome: "failed", reason: "Error" });
+		expect(JSON.stringify(harness.shadowEntries()[0])).not.toContain("LEAKED_PLANNER_EXCERPT");
+	});
+
+	it("captures planner and child usage snapshots in delegated records", async () => {
+		const harness = new Harness();
+		harness.config = delegationConfig();
+		await harness.lifecycle();
+		harness.classifications = ["low"];
+		harness.planResults = [
+			{ delegate: true, agent: "scout", task: "standalone task assignment", usage: plannerProviderUsage },
+		];
+		harness.executeResults = [singleResult({ output: "child output text", usage: childProviderUsage })];
+		expect(await harness.input("summarize the repository layout")).toEqual({ handled: true });
+		await harness.settle(() => harness.customMessages.length === 1);
+
+		const statuses = harness.delegationEntries().map(entry => entry.status);
+		expect(statuses).toEqual(["pending", "delegated", "completed"]);
+		expect(harness.delegationEntries()[0]?.measurement).toEqual({
+			parentContextTokens: 100,
+			plannerUsage: null,
+			childUsage: null,
+		});
+		expect(harness.delegationEntries()[1]?.measurement).toEqual({
+			parentContextTokens: 100,
+			plannerUsage: plannerUsageSnapshot,
+			childUsage: null,
+		});
+		expect(harness.delegationEntries()[2]?.measurement).toEqual({
+			parentContextTokens: 100,
+			plannerUsage: plannerUsageSnapshot,
+			childUsage: childUsageSnapshot,
+		});
+	});
+
+	it("aggregates confirmed assistant usage and finalizes only on terminal agent_end", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: false, reason: "main path is fine", usage: plannerProviderUsage }];
+		const prompt = "measure this parent turn cost";
+		await harness.input(prompt);
+		await harness.settle(() => harness.shadowEntries().length === 1);
+		expect(harness.shadowEntries()[0]).toMatchObject({ outcome: "decline", plannerUsage: plannerUsageSnapshot });
+		const runId = harness.shadowEntries()[0]?.runId as string;
+
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(99, 99, 0.99)));
+		await harness.messageEnd(userEndMessage("a different prompt entirely"));
+		await harness.messageEnd(userEndMessage(prompt));
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(10, 2, 0.25)));
+		await harness.agentEnd(true);
+		expect(harness.measuredEntries()).toEqual([]);
+
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(5, 1, 0.5)));
+		await harness.agentEnd(false);
+		expect(harness.measuredEntries()).toEqual([
+			{
+				status: "measured",
+				runId,
+				parentUsage: {
+					input: 15,
+					output: 3,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 18,
+					cost: 0.75,
+				},
+			},
+		]);
+
+		await harness.agentEnd(false);
+		expect(harness.measuredEntries()).toHaveLength(1);
+	});
+
+	it("attributes a confirmed replay by prefix and drops an unconfirmed one on lifecycle reset", async () => {
+		const confirmed = new Harness();
+		confirmed.config = delegationConfig();
+		await confirmed.lifecycle();
+		confirmed.classifications = ["low"];
+		confirmed.planResults = [
+			{ delegate: true, agent: "scout", task: "standalone task assignment", usage: plannerProviderUsage },
+		];
+		confirmed.executeResults = [singleResult({ exitCode: 1, error: "child exploded", output: "" })];
+		await confirmed.input("the original standalone request");
+		await confirmed.settle(() => confirmed.userMessages.length === 1);
+		const workflowRunId = confirmed.delegationEntries()[0]?.runId as string;
+
+		await confirmed.messageEnd(userEndMessage(confirmed.userMessages[0]?.content as string));
+		await confirmed.messageEnd(assistantEndMessage(parentAssistantUsage(8, 4, 0.5)));
+		await confirmed.agentEnd(false);
+		expect(confirmed.measuredEntries()).toEqual([
+			{
+				status: "measured",
+				runId: workflowRunId,
+				parentUsage: {
+					input: 8,
+					output: 4,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 12,
+					cost: 0.5,
+				},
+			},
+		]);
+
+		const reset = new Harness();
+		reset.config = delegationConfig();
+		await reset.lifecycle();
+		reset.classifications = ["low"];
+		reset.planResults = [{ delegate: false, reason: "needs context" }];
+		await reset.input("an eligible standalone request");
+		await reset.settle(() => reset.userMessages.length === 1);
+
+		await reset.lifecycle("session_switch");
+		await reset.messageEnd(userEndMessage("an eligible standalone request"));
+		await reset.messageEnd(assistantEndMessage(parentAssistantUsage(8, 4, 0.5)));
+		await reset.agentEnd(false);
+		expect(reset.measuredEntries()).toEqual([]);
+	});
+
+	it("keeps /usage and slash-command bypasses ahead of shadow sampling", async () => {
+		const harness = await sampledHarness(1, 0);
+		for (const text of ["/usage", "/route status", "-> shell command", "=> python snippet"]) {
+			expect(await harness.input(text)).toBeUndefined();
+		}
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
+	});
+
+	it("reports measurement state and rate in the status line", async () => {
+		const off = new Harness();
+		await off.lifecycle();
+		await off.command("status");
+		expect(off.notifications.at(-1)?.message).toContain("measurement off");
+
+		const on = await sampledHarness(0.5, 0.9);
+		await on.command("status");
+		expect(on.notifications.at(-1)?.message).toContain("measurement on (50%)");
+		expect(on.notifications.at(-1)?.message).toContain("delegation off");
 	});
 });
