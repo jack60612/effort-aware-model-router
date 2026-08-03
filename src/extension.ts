@@ -299,6 +299,8 @@ export function createModelRouterExtension(
 		let delegationRunSequence = 0;
 		let shadowRunSequence = 0;
 		let shadowController: AbortController | undefined;
+		/** Bumped on every session reset so a stale detached shadow can never append into a successor session. */
+		let measurementGeneration = 0;
 		let pendingParentMeasurements: PendingParentMeasurement[] = [];
 		const delegationStatus = (): string => {
 			const measurement = config.delegation.measurement;
@@ -705,6 +707,7 @@ export function createModelRouterExtension(
 
 		/** Abort measurement work so a prior session can never consume later lifecycle events. */
 		const resetMeasurement = (reason: string): void => {
+			measurementGeneration += 1;
 			shadowController?.abort(new Error(reason));
 			shadowController = undefined;
 			for (const record of pendingParentMeasurements) clearTimeout(record.timer);
@@ -907,7 +910,9 @@ export function createModelRouterExtension(
 			shadowRunSequence += 1;
 			const runId = `model-router-shadow-${shadowRunSequence}`;
 			const startedAt = now();
+			const generation = measurementGeneration;
 			const recordShadow = (outcome: string, detail: Record<string, unknown> = {}): void => {
+				if (generation !== measurementGeneration) return;
 				appendMeasurementEntry({
 					status: "shadow",
 					runId,

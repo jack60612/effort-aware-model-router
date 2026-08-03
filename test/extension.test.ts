@@ -1439,7 +1439,34 @@ describe("model router measurement", () => {
 			reason: "shadow active",
 		});
 		await harness.shutdown();
-		await harness.settle(() => harness.shadowEntries().some(entry => entry.outcome === "cancelled"));
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+		expect(harness.shadowEntries()).toHaveLength(1);
+		expect(harness.shadowEntries().some(entry => entry.outcome === "cancelled")).toBe(false);
+	});
+
+	it("suppresses a stale shadow's appends after a session reset while later shadows still record", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low", "low"];
+		const deferred = Promise.withResolvers<DelegationPlan>();
+		harness.planResults = [() => deferred.promise, { delegate: false, reason: "successor decline" }];
+		await harness.input("the original sampled standalone prompt");
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.lifecycle("session_switch");
+		const entriesBeforeResolve = harness.delegationEntries().length;
+		deferred.resolve({ delegate: true, agent: "scout", task: "stale task" });
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+		expect(harness.delegationEntries()).toHaveLength(entriesBeforeResolve);
+		expect(harness.shadowEntries()).toEqual([]);
+		expect(harness.measuredEntries()).toEqual([]);
+
+		await harness.input("a fresh prompt in the successor session");
+		await harness.settle(() => harness.shadowEntries().length === 1);
+		expect(harness.shadowEntries()[0]).toMatchObject({
+			status: "shadow",
+			outcome: "decline",
+			runId: "model-router-shadow-2",
+		});
 	});
 
 	it("captures planner and child usage snapshots in delegated records", async () => {
