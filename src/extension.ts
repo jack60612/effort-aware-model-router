@@ -1,11 +1,13 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type {
+	AgentEndEvent,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionFactory,
 	InputEvent,
 	InputEventResult,
+	MessageEndEvent,
 	SessionBranchEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
@@ -18,6 +20,7 @@ import { Text } from "@oh-my-pi/pi-tui";
 import { classifyPromptEffort } from "./classifier";
 import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, type RouteEffort, type RouterConfig } from "./config";
 import { type DelegationPlan, loadRepositoryAgentIndex, planDelegation } from "./delegation";
+import { aggregateUsage, shouldSampleShadow, snapshotUsage, type UsageSnapshot } from "./measurement";
 import {
 	clampEffortToModel,
 	estimatePromptTokens,
@@ -114,6 +117,7 @@ export interface ModelRouterExtensionDependencies {
 	discover?: typeof discoverAgents;
 	execute?: typeof runSubprocess;
 	loadAgentIndex?: typeof loadRepositoryAgentIndex;
+	random?: () => number;
 }
 
 /** Successfully applied route: the model now active for the prompt plus its applied efforts. */
@@ -131,6 +135,45 @@ interface DelegationWorkflow {
 	controller: AbortController;
 	request: string;
 	startedAt: number;
+	parentContextTokens: number | null;
+	plannerUsage: UsageSnapshot | null;
+	childUsage: UsageSnapshot | null;
+}
+
+/** Five-minute cap for an armed parent correlation that never confirms or settles. */
+const PARENT_CORRELATION_TIMEOUT_MS = 300_000;
+
+/**
+ * One armed parent-turn correlation: confirmed by a matching user
+ * `message_end`, filled by assistant `message_end` usage snapshots, settled
+ * only at a terminal `agent_end`.
+ */
+type PendingParentMeasurement = {
+	runId: string;
+	expectedPrefix: string;
+	/** Sampled prompts must match exactly; replays only prefix the delivered follow-up text. */
+	match: "exact" | "prefix";
+	phase: "awaiting-user" | "collecting-assistant";
+	assistantUsage: UsageSnapshot[];
+	timer: ReturnType<typeof setTimeout>;
+	onComplete: (usage: UsageSnapshot | null) => void;
+};
+
+function agentMessageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const part of content) {
+		if (
+			typeof part === "object" &&
+			part !== null &&
+			(part as { type?: unknown }).type === "text" &&
+			typeof (part as { text?: unknown }).text === "string"
+		) {
+			parts.push((part as { text: string }).text);
+		}
+	}
+	return parts.join("\n");
 }
 
 function identityOf(model: Pick<Model, "provider" | "id"> | undefined): ModelIdentity | null {
@@ -224,6 +267,7 @@ function defaultConfig(): RouterConfig {
 			enabled: DEFAULT_ROUTER_CONFIG.delegation.enabled,
 			plannerTimeoutMs: DEFAULT_ROUTER_CONFIG.delegation.plannerTimeoutMs,
 			agents: [...DEFAULT_ROUTER_CONFIG.delegation.agents],
+			measurement: { ...DEFAULT_ROUTER_CONFIG.delegation.measurement },
 		},
 	};
 }
@@ -246,14 +290,23 @@ export function createModelRouterExtension(
 	const discover = dependencies.discover ?? discoverAgents;
 	const execute = dependencies.execute ?? runSubprocess;
 	const loadAgentIndex = dependencies.loadAgentIndex ?? loadRepositoryAgentIndex;
+	const random = dependencies.random ?? Math.random;
 
 	return (pi: ExtensionAPI): void => {
 		let config = defaultConfig();
 		let state: RouterState | undefined;
 		let activeDelegation: DelegationWorkflow | undefined;
 		let delegationRunSequence = 0;
-		const delegationStatus = (): string =>
-			`delegation ${config.delegation.enabled ? "on" : "off"} (${activeDelegation ? "active" : "idle"})`;
+		let shadowRunSequence = 0;
+		let shadowController: AbortController | undefined;
+		let pendingParentMeasurements: PendingParentMeasurement[] = [];
+		const delegationStatus = (): string => {
+			const measurement = config.delegation.measurement;
+			const measurementText = measurement.enabled
+				? `measurement on (${Math.round(measurement.sampleRate * 100)}%)`
+				: "measurement off";
+			return `delegation ${config.delegation.enabled ? "on" : "off"} (${activeDelegation ? "active" : "idle"}) · ${measurementText}`;
+		};
 		/** The one status-bar string: route summary plus the delegation suffix, everywhere. */
 		const routerStatus = (runtime: RouterState): string => `${routeStatus(runtime)} · ${delegationStatus()}`;
 
@@ -621,6 +674,43 @@ export function createModelRouterExtension(
 			if (state) ctx.ui.setStatus(STATUS_KEY, routerStatus(state));
 		};
 
+		/** Measurement metadata must never fail routing, delegation, or replay. */
+		const appendMeasurementEntry = (data: Record<string, unknown>): void => {
+			try {
+				pi.appendEntry(MODEL_ROUTER_DELEGATION_ENTRY, data);
+			} catch (error) {
+				pi.logger.warn(`model-router: measurement entry failed: ${conciseReason(error)}`);
+			}
+		};
+
+		const armParentMeasurement = (
+			runId: string,
+			expectedPrefix: string,
+			match: PendingParentMeasurement["match"],
+		): void => {
+			const record: PendingParentMeasurement = {
+				runId,
+				expectedPrefix,
+				match,
+				phase: "awaiting-user",
+				assistantUsage: [],
+				timer: setTimeout(() => {
+					pendingParentMeasurements = pendingParentMeasurements.filter(pending => pending !== record);
+				}, PARENT_CORRELATION_TIMEOUT_MS),
+				onComplete: usage => appendMeasurementEntry({ status: "measured", runId, parentUsage: usage }),
+			};
+			record.timer.unref();
+			pendingParentMeasurements.push(record);
+		};
+
+		/** Abort measurement work so a prior session can never consume later lifecycle events. */
+		const resetMeasurement = (reason: string): void => {
+			shadowController?.abort(new Error(reason));
+			shadowController = undefined;
+			for (const record of pendingParentMeasurements) clearTimeout(record.timer);
+			pendingParentMeasurements = [];
+		};
+
 		/** Synchronous gate; MUST NOT await so eligible input is claimed before any provider call. */
 		const delegationEligible = (event: InputEvent, runtime: RouterState): boolean =>
 			config.delegation.enabled &&
@@ -642,6 +732,11 @@ export function createModelRouterExtension(
 					runId,
 					request: workflow.request,
 					startedAt: workflow.startedAt,
+					measurement: {
+						parentContextTokens: workflow.parentContextTokens,
+						plannerUsage: workflow.plannerUsage,
+						childUsage: workflow.childUsage,
+					},
 					...detail,
 				});
 			};
@@ -651,6 +746,7 @@ export function createModelRouterExtension(
 			const replayOriginal = (status: DelegationEntryStatus, reason: string): void => {
 				record(status, { reason });
 				releaseDelegation(runId, ctx);
+				armParentMeasurement(runId, workflow.request, "prefix");
 				pi.sendUserMessage(workflow.request, { deliverAs: "followUp" });
 			};
 			let delegated: { agent: AgentDefinition; task: string; model: string } | undefined;
@@ -668,6 +764,7 @@ export function createModelRouterExtension(
 					{ triggerTurn: false },
 				);
 				releaseDelegation(runId, ctx);
+				armParentMeasurement(runId, workflow.request, "prefix");
 				pi.sendUserMessage(
 					`${workflow.request}\n\nWarning: a delegated subagent attempt failed and may have produced side effects; inspect the current state before repeating work.`,
 					{ deliverAs: "followUp" },
@@ -696,6 +793,7 @@ export function createModelRouterExtension(
 						signal: controller.signal,
 					},
 				);
+				workflow.plannerUsage = snapshotUsage(plan.usage);
 				if (controller.signal.aborted) return cancelled();
 				if (!plan.delegate) return replayOriginal("passed-through", plan.reason);
 				const definition = eligibleAgents.find(agent => agent.name === plan.agent);
@@ -719,6 +817,7 @@ export function createModelRouterExtension(
 					signal: controller.signal,
 					keepAlive: false,
 				});
+				workflow.childUsage = snapshotUsage(result.usage);
 				if (controller.signal.aborted) return cancelled({ agent: definition.name });
 				if (result.aborted) {
 					return childFailure(result.abortReason ?? result.error ?? "subagent aborted before completion");
@@ -768,6 +867,9 @@ export function createModelRouterExtension(
 				controller: new AbortController(),
 				request: event.text,
 				startedAt: now(),
+				parentContextTokens: ctx.getContextUsage()?.tokens ?? null,
+				plannerUsage: null,
+				childUsage: null,
 			};
 			activeDelegation = workflow;
 			pi.appendEntry(MODEL_ROUTER_DELEGATION_ENTRY, {
@@ -775,12 +877,96 @@ export function createModelRouterExtension(
 				runId: workflow.runId,
 				request: workflow.request,
 				startedAt: workflow.startedAt,
+				measurement: {
+					parentContextTokens: workflow.parentContextTokens,
+					plannerUsage: null,
+					childUsage: null,
+				},
 			});
 			void processDelegation(event, ctx, workflow).catch((error: unknown) => {
 				pi.logger.warn(`model-router: delegation workflow ${workflow.runId} crashed: ${conciseReason(error)}`);
 				releaseDelegation(workflow.runId, ctx);
 			});
 			return { handled: true };
+		};
+
+		/** Detached planner shadow for a sampled main-path prompt; never touches the main turn. */
+		const startShadowMeasurement = (
+			event: InputEvent,
+			ctx: ExtensionContext,
+			routed: RoutedPrompt | undefined,
+		): void => {
+			const measurement = config.delegation.measurement;
+			if (!measurement.enabled) return;
+			if (event.images !== undefined && event.images.length > 0) return;
+			if (event.text.trim().length < config.classifierMinPromptChars) return;
+			const model = routed?.model ?? currentModel(ctx);
+			if (!model) return;
+			const parentContextTokens = ctx.getContextUsage()?.tokens ?? null;
+			if (!shouldSampleShadow(measurement.sampleRate, random())) return;
+			shadowRunSequence += 1;
+			const runId = `model-router-shadow-${shadowRunSequence}`;
+			const startedAt = now();
+			const recordShadow = (outcome: string, detail: Record<string, unknown> = {}): void => {
+				appendMeasurementEntry({
+					status: "shadow",
+					runId,
+					startedAt,
+					outcome,
+					model: formatModelSelector(model),
+					parentContextTokens,
+					sampleRate: measurement.sampleRate,
+					durationMs: now() - startedAt,
+					...detail,
+				});
+			};
+			if (shadowController !== undefined) {
+				recordShadow("skipped", { reason: "shadow active" });
+				return;
+			}
+			const controller = new AbortController();
+			shadowController = controller;
+			armParentMeasurement(runId, event.text, "exact");
+			const run = async (): Promise<void> => {
+				try {
+					const discovery = await discover(ctx.cwd);
+					if (controller.signal.aborted) return recordShadow("cancelled");
+					const allowed = new Set(config.delegation.agents);
+					const eligibleAgents = discovery.agents.filter(agent => allowed.has(agent.name));
+					if (eligibleAgents.length === 0) {
+						return recordShadow("skipped", { reason: "no eligible agents" });
+					}
+					const repositoryIndex = await loadAgentIndex(ctx.cwd);
+					if (controller.signal.aborted) return recordShadow("cancelled");
+					const plan: DelegationPlan = await planWorkflow(
+						event.text,
+						model,
+						eligibleAgents.map(agent => ({ name: agent.name, description: agent.description })),
+						repositoryIndex,
+						config.delegation,
+						{
+							modelRegistry: ctx.modelRegistry,
+							sessionId: ctx.sessionManager.getSessionId(),
+							signal: controller.signal,
+						},
+					);
+					if (controller.signal.aborted) return recordShadow("cancelled");
+					const plannerUsage = snapshotUsage(plan.usage);
+					if (plan.delegate) {
+						recordShadow("delegate", { agent: plan.agent, taskChars: plan.task.length, plannerUsage });
+					} else {
+						recordShadow("decline", { plannerUsage });
+					}
+				} catch (error) {
+					if (controller.signal.aborted) return recordShadow("cancelled");
+					const reason = conciseReason(error);
+					pi.logger.warn(`model-router: shadow measurement ${runId} failed: ${reason}`);
+					recordShadow("failed", { reason });
+				} finally {
+					if (shadowController === controller) shadowController = undefined;
+				}
+			};
+			void run();
 		};
 
 		pi.registerCommand("route", {
@@ -888,15 +1074,59 @@ export function createModelRouterExtension(
 		const handleSessionLifecycle = (
 			_event: SessionStartEvent | SessionBranchEvent | SessionTreeEvent,
 			ctx: ExtensionContext,
-		): Promise<void> => rehydrate(ctx);
-		const handleSessionSwitch = (_event: SessionSwitchEvent, ctx: ExtensionContext): Promise<void> =>
-			rehydrate(ctx, true);
+		): Promise<void> => {
+			resetMeasurement("model-router: shadow cancelled by session lifecycle");
+			return rehydrate(ctx);
+		};
+		const handleSessionSwitch = (_event: SessionSwitchEvent, ctx: ExtensionContext): Promise<void> => {
+			resetMeasurement("model-router: shadow cancelled by session switch");
+			return rehydrate(ctx, true);
+		};
 		pi.on("session_start", handleSessionLifecycle);
 		pi.on("session_switch", handleSessionSwitch);
 		pi.on("session_branch", handleSessionLifecycle);
 		pi.on("session_tree", handleSessionLifecycle);
 		pi.on("session_shutdown", async (_event: SessionShutdownEvent): Promise<void> => {
 			activeDelegation?.controller.abort(new Error("model-router: delegation cancelled by session shutdown"));
+			resetMeasurement("model-router: shadow cancelled by session shutdown");
+		});
+
+		pi.on("message_end", async (event: MessageEndEvent): Promise<void> => {
+			const message = event.message;
+			if (message.role === "user") {
+				const text = agentMessageText(message.content);
+				for (const record of pendingParentMeasurements) {
+					if (record.phase !== "awaiting-user") continue;
+					const matched =
+						record.match === "exact"
+							? text === record.expectedPrefix
+							: text.startsWith(record.expectedPrefix);
+					if (matched) {
+						record.phase = "collecting-assistant";
+						break;
+					}
+				}
+				return;
+			}
+			if (message.role !== "assistant") return;
+			const snapshot = snapshotUsage(message.usage);
+			if (!snapshot) return;
+			for (const record of pendingParentMeasurements) {
+				if (record.phase === "collecting-assistant") record.assistantUsage.push(snapshot);
+			}
+		});
+
+		pi.on("agent_end", async (event: AgentEndEvent): Promise<void> => {
+			if (event.willContinue === true) return;
+			const settled = pendingParentMeasurements.filter(record => record.phase === "collecting-assistant");
+			if (settled.length === 0) return;
+			pendingParentMeasurements = pendingParentMeasurements.filter(
+				record => record.phase !== "collecting-assistant",
+			);
+			for (const record of settled) {
+				clearTimeout(record.timer);
+				record.onComplete(aggregateUsage(record.assistantUsage));
+			}
 		});
 
 		pi.registerMessageRenderer(MODEL_ROUTER_DELEGATION_MESSAGE, message => {
@@ -922,7 +1152,8 @@ export function createModelRouterExtension(
 			const text = event.text.trim();
 			if (text.length === 0 || text.startsWith("/") || text.startsWith("->") || text.startsWith("=>")) return;
 			if (delegationEligible(event, ensureState(ctx))) return claimDelegation(event, ctx);
-			await routePrompt(event, ctx);
+			const routed = await routePrompt(event, ctx);
+			startShadowMeasurement(event, ctx, routed);
 		});
 	};
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model, Usage } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -73,7 +73,12 @@ function routerConfig(overrides: Partial<RouterConfig> = {}): RouterConfig {
 		classifierMinPromptChars: 0,
 		classifierCooldownMs: 0,
 		thinkingProfiles: {},
-		delegation: { enabled: false, plannerTimeoutMs: 5_000, agents: ["scout", "task"] },
+		delegation: {
+			enabled: false,
+			plannerTimeoutMs: 5_000,
+			agents: ["scout", "task"],
+			measurement: { enabled: false, sampleRate: 0.1 },
+		},
 		...overrides,
 	};
 }
@@ -84,7 +89,26 @@ function delegationConfig(
 ): RouterConfig {
 	return routerConfig({
 		...base,
-		delegation: { enabled: true, plannerTimeoutMs: 5_000, agents: ["scout", "task"], ...delegation },
+		delegation: {
+			enabled: true,
+			plannerTimeoutMs: 5_000,
+			agents: ["scout", "task"],
+			measurement: { enabled: false, sampleRate: 0.1 },
+			...delegation,
+		},
+	});
+}
+
+/** Delegation disabled, shadow measurement armed: the sampled main-path configuration. */
+function measurementConfig(sampleRate = 0.5, base: Partial<RouterConfig> = {}): RouterConfig {
+	return routerConfig({
+		...base,
+		delegation: {
+			enabled: false,
+			plannerTimeoutMs: 5_000,
+			agents: ["scout", "task"],
+			measurement: { enabled: true, sampleRate },
+		},
 	});
 }
 
@@ -111,6 +135,67 @@ function singleResult(overrides: Partial<SingleResult> = {}): SingleResult {
 }
 
 const pngImage: ImageContent = { type: "image", data: "aGk=", mimeType: "image/png" };
+
+const plannerProviderUsage: Usage = {
+	input: 120,
+	output: 34,
+	cacheRead: 56,
+	cacheWrite: 7,
+	totalTokens: 217,
+	cost: { input: 0.12, output: 0.34, cacheRead: 0.056, cacheWrite: 0.007, total: 0.523 },
+};
+const plannerUsageSnapshot = {
+	input: 120,
+	output: 34,
+	cacheRead: 56,
+	cacheWrite: 7,
+	totalTokens: 217,
+	cost: 0.523,
+};
+const childProviderUsage: Usage = {
+	input: 40,
+	output: 10,
+	cacheRead: 5,
+	cacheWrite: 2,
+	totalTokens: 57,
+	cost: { input: 0.04, output: 0.1, cacheRead: 0.005, cacheWrite: 0.002, total: 0.147 },
+};
+const childUsageSnapshot = {
+	input: 40,
+	output: 10,
+	cacheRead: 5,
+	cacheWrite: 2,
+	totalTokens: 57,
+	cost: 0.147,
+};
+
+function parentAssistantUsage(input: number, output: number, costTotal: number): Usage {
+	return {
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: input + output,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: costTotal },
+	};
+}
+
+function assistantEndMessage(usage: Usage): Record<string, unknown> {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "assistant reply" }],
+		api: "openai-responses",
+		provider: "mock",
+		model: "base",
+		usage,
+		stopReason: "stop",
+		timestamp: 1,
+	};
+}
+
+function userEndMessage(text: string): Record<string, unknown> {
+	return { role: "user", content: text, timestamp: 1 };
+}
 
 type PlanCall = {
 	promptText: string;
@@ -153,6 +238,8 @@ class Harness {
 	setModelResults: Array<boolean | Error> = [];
 	config = routerConfig();
 	now = 1_000;
+	/** Deterministic sample source; defaults to rejecting every shadow sample. */
+	randomValue = 0.999;
 	loadCount = 0;
 	setupCalls = 0;
 	setupContexts: RouterSetupContext[] = [];
@@ -325,6 +412,7 @@ class Harness {
 				return next;
 			},
 			loadAgentIndex: async () => this.agentIndex,
+			random: () => this.randomValue,
 		})(this.api);
 	}
 
@@ -346,6 +434,14 @@ class Harness {
 		await this.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, this.ctx);
 	}
 
+	async messageEnd(message: Record<string, unknown>): Promise<void> {
+		await this.handlers.get("message_end")?.({ type: "message_end", message }, this.ctx);
+	}
+
+	async agentEnd(willContinue: boolean, messages: unknown[] = []): Promise<void> {
+		await this.handlers.get("agent_end")?.({ type: "agent_end", messages, willContinue }, this.ctx);
+	}
+
 	/** Flush microtask turns until the fire-and-forget pipeline reaches the observable state. */
 	async settle(predicate: () => boolean): Promise<void> {
 		for (let turn = 0; turn < 1_000; turn += 1) {
@@ -359,6 +455,14 @@ class Harness {
 		return this.entries
 			.filter(entry => entry.customType === MODEL_ROUTER_DELEGATION_ENTRY)
 			.map(entry => entry.data as Record<string, unknown>);
+	}
+
+	shadowEntries(): Array<Record<string, unknown>> {
+		return this.delegationEntries().filter(entry => entry.status === "shadow");
+	}
+
+	measuredEntries(): Array<Record<string, unknown>> {
+		return this.delegationEntries().filter(entry => entry.status === "measured");
 	}
 
 	async command(args: string): Promise<void> {
@@ -383,7 +487,9 @@ describe("model router extension", () => {
 	it("registers public lifecycle/input handlers and the route command", () => {
 		const harness = new Harness();
 		expect([...harness.handlers.keys()].sort()).toEqual([
+			"agent_end",
 			"input",
+			"message_end",
 			"session_branch",
 			"session_shutdown",
 			"session_start",
@@ -1241,5 +1347,235 @@ describe("model router delegation", () => {
 		);
 		expect(component).toBeInstanceOf(Text);
 		expect((component as Text).getText()).toBe("delegated result body");
+	});
+});
+
+describe("model router measurement", () => {
+	function abortableShadowPlan(call: PlanCall): Promise<DelegationPlan> {
+		const { promise, reject } = Promise.withResolvers<DelegationPlan>();
+		call.ctx.signal?.addEventListener("abort", () => reject(call.ctx.signal?.reason ?? new Error("aborted")));
+		return promise;
+	}
+
+	async function sampledHarness(sampleRate = 0.5, randomValue = 0.25): Promise<Harness> {
+		const harness = new Harness();
+		harness.config = measurementConfig(sampleRate);
+		harness.randomValue = randomValue;
+		await harness.lifecycle();
+		return harness;
+	}
+
+	it("starts a sampled main-path planner shadow without executor or message calls", async () => {
+		const harness = await sampledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [
+			{ delegate: true, agent: "scout", task: "shadow standalone task", usage: plannerProviderUsage },
+		];
+		expect(await harness.input("please summarize the repository layout")).toBeUndefined();
+		await harness.settle(() => harness.shadowEntries().length === 1);
+
+		expect(harness.planCalls).toHaveLength(1);
+		expect(harness.planCalls[0]?.model.id).toBe("smol");
+		expect(harness.planCalls[0]?.promptText).toBe("please summarize the repository layout");
+		expect(harness.executeCalls).toEqual([]);
+		expect(harness.userMessages).toEqual([]);
+		expect(harness.customMessages).toEqual([]);
+		const entry = harness.shadowEntries()[0];
+		expect(entry).toMatchObject({
+			status: "shadow",
+			outcome: "delegate",
+			model: "mock/smol",
+			parentContextTokens: 100,
+			sampleRate: 0.5,
+			agent: "scout",
+			taskChars: "shadow standalone task".length,
+			plannerUsage: plannerUsageSnapshot,
+		});
+		expect(entry?.task).toBeUndefined();
+		expect(entry?.request).toBeUndefined();
+	});
+
+	it("makes no planner call when the sample is rejected", async () => {
+		const harness = await sampledHarness(0.5, 0.9);
+		harness.classifications = ["low"];
+		expect(await harness.input("please summarize the repository layout")).toBeUndefined();
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["smol"]);
+	});
+
+	it("records a skip without planning when no discovered agent is allowlisted", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.discoveredAgents = [agentDefinition("rogue", "not allowlisted")];
+		harness.classifications = ["low"];
+		await harness.input("please summarize the repository layout");
+		await harness.settle(() => harness.shadowEntries().length === 1);
+
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.shadowEntries()[0]).toMatchObject({
+			status: "shadow",
+			outcome: "skipped",
+			reason: "no eligible agents",
+		});
+	});
+
+	it("skips a second sampled prompt while a shadow is active without a provider call", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low", "low"];
+		harness.planResults = [abortableShadowPlan];
+		await harness.input("the first sampled standalone prompt");
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.input("the second sampled standalone prompt");
+		await harness.settle(() =>
+			harness.shadowEntries().some(entry => entry.outcome === "skipped"),
+		);
+		expect(harness.planCalls).toHaveLength(1);
+		expect(harness.shadowEntries().at(-1)).toMatchObject({
+			status: "shadow",
+			outcome: "skipped",
+			reason: "shadow active",
+		});
+		await harness.shutdown();
+		await harness.settle(() => harness.shadowEntries().some(entry => entry.outcome === "cancelled"));
+	});
+
+	it("captures planner and child usage snapshots in delegated records", async () => {
+		const harness = new Harness();
+		harness.config = delegationConfig();
+		await harness.lifecycle();
+		harness.classifications = ["low"];
+		harness.planResults = [
+			{ delegate: true, agent: "scout", task: "standalone task assignment", usage: plannerProviderUsage },
+		];
+		harness.executeResults = [singleResult({ output: "child output text", usage: childProviderUsage })];
+		expect(await harness.input("summarize the repository layout")).toEqual({ handled: true });
+		await harness.settle(() => harness.customMessages.length === 1);
+
+		const statuses = harness.delegationEntries().map(entry => entry.status);
+		expect(statuses).toEqual(["pending", "delegated", "completed"]);
+		expect(harness.delegationEntries()[0]?.measurement).toEqual({
+			parentContextTokens: 100,
+			plannerUsage: null,
+			childUsage: null,
+		});
+		expect(harness.delegationEntries()[1]?.measurement).toEqual({
+			parentContextTokens: 100,
+			plannerUsage: plannerUsageSnapshot,
+			childUsage: null,
+		});
+		expect(harness.delegationEntries()[2]?.measurement).toEqual({
+			parentContextTokens: 100,
+			plannerUsage: plannerUsageSnapshot,
+			childUsage: childUsageSnapshot,
+		});
+	});
+
+	it("aggregates confirmed assistant usage and finalizes only on terminal agent_end", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: false, reason: "main path is fine", usage: plannerProviderUsage }];
+		const prompt = "measure this parent turn cost";
+		await harness.input(prompt);
+		await harness.settle(() => harness.shadowEntries().length === 1);
+		expect(harness.shadowEntries()[0]).toMatchObject({ outcome: "decline", plannerUsage: plannerUsageSnapshot });
+		const runId = harness.shadowEntries()[0]?.runId as string;
+
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(99, 99, 0.99)));
+		await harness.messageEnd(userEndMessage("a different prompt entirely"));
+		await harness.messageEnd(userEndMessage(prompt));
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(10, 2, 0.25)));
+		await harness.agentEnd(true);
+		expect(harness.measuredEntries()).toEqual([]);
+
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(5, 1, 0.5)));
+		await harness.agentEnd(false);
+		expect(harness.measuredEntries()).toEqual([
+			{
+				status: "measured",
+				runId,
+				parentUsage: {
+					input: 15,
+					output: 3,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 18,
+					cost: 0.75,
+				},
+			},
+		]);
+
+		await harness.agentEnd(false);
+		expect(harness.measuredEntries()).toHaveLength(1);
+	});
+
+	it("attributes a confirmed replay by prefix and drops an unconfirmed one on lifecycle reset", async () => {
+		const confirmed = new Harness();
+		confirmed.config = delegationConfig();
+		await confirmed.lifecycle();
+		confirmed.classifications = ["low"];
+		confirmed.planResults = [
+			{ delegate: true, agent: "scout", task: "standalone task assignment", usage: plannerProviderUsage },
+		];
+		confirmed.executeResults = [singleResult({ exitCode: 1, error: "child exploded", output: "" })];
+		await confirmed.input("the original standalone request");
+		await confirmed.settle(() => confirmed.userMessages.length === 1);
+		const workflowRunId = confirmed.delegationEntries()[0]?.runId as string;
+
+		await confirmed.messageEnd(userEndMessage(confirmed.userMessages[0]?.content as string));
+		await confirmed.messageEnd(assistantEndMessage(parentAssistantUsage(8, 4, 0.5)));
+		await confirmed.agentEnd(false);
+		expect(confirmed.measuredEntries()).toEqual([
+			{
+				status: "measured",
+				runId: workflowRunId,
+				parentUsage: {
+					input: 8,
+					output: 4,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 12,
+					cost: 0.5,
+				},
+			},
+		]);
+
+		const reset = new Harness();
+		reset.config = delegationConfig();
+		await reset.lifecycle();
+		reset.classifications = ["low"];
+		reset.planResults = [{ delegate: false, reason: "needs context" }];
+		await reset.input("an eligible standalone request");
+		await reset.settle(() => reset.userMessages.length === 1);
+
+		await reset.lifecycle("session_switch");
+		await reset.messageEnd(userEndMessage("an eligible standalone request"));
+		await reset.messageEnd(assistantEndMessage(parentAssistantUsage(8, 4, 0.5)));
+		await reset.agentEnd(false);
+		expect(reset.measuredEntries()).toEqual([]);
+	});
+
+	it("keeps /usage and slash-command bypasses ahead of shadow sampling", async () => {
+		const harness = await sampledHarness(1, 0);
+		for (const text of ["/usage", "/route status", "-> shell command", "=> python snippet"]) {
+			expect(await harness.input(text)).toBeUndefined();
+		}
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+		expect(harness.planCalls).toEqual([]);
+		expect(harness.delegationEntries()).toEqual([]);
+	});
+
+	it("reports measurement state and rate in the status line", async () => {
+		const off = new Harness();
+		await off.lifecycle();
+		await off.command("status");
+		expect(off.notifications.at(-1)?.message).toContain("measurement off");
+
+		const on = await sampledHarness(0.5, 0.9);
+		await on.command("status");
+		expect(on.notifications.at(-1)?.message).toContain("measurement on (50%)");
+		expect(on.notifications.at(-1)?.message).toContain("delegation off");
 	});
 });
