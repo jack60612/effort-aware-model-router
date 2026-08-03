@@ -39,7 +39,12 @@ export interface RouterSetupValues {
 	classifierMinPromptChars: number;
 	classifierCooldownMs: number;
 	thinkingProfiles: RouterThinkingProfiles;
-	delegation: RouterDelegationConfig;
+	/**
+	 * Setup owns only these delegation keys; `writeRouterConfigLayer` spreads the
+	 * existing raw delegation object first, so `measurement` and unknown nested
+	 * fields pass through unchanged without a wizard control.
+	 */
+	delegation: Pick<RouterDelegationConfig, "enabled" | "plannerTimeoutMs" | "agents">;
 }
 
 export interface RouterSetupFileSystem {

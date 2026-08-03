@@ -22,6 +22,7 @@ const config: RouterConfig = {
 		enabled: false,
 		plannerTimeoutMs: 20_000,
 		agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+		measurement: { enabled: false, sampleRate: 0.1 },
 	},
 };
 
@@ -306,7 +307,12 @@ describe("runRouterSetup", () => {
 		);
 		const advanced: RouterConfig = {
 			...config,
-			delegation: { enabled: false, plannerTimeoutMs: 45_000, agents: ["scout"] },
+			delegation: {
+				enabled: false,
+				plannerTimeoutMs: 45_000,
+				agents: ["scout"],
+				measurement: { enabled: false, sampleRate: 0.1 },
+			},
 		};
 
 		const result = await runRouterSetup(setupContext(ui), advanced);
@@ -318,6 +324,40 @@ describe("runRouterSetup", () => {
 			enabled: true,
 			plannerTimeoutMs: 45_000,
 			agents: ["scout"],
+			note: "keep",
+		});
+	});
+
+	it("preserves an existing nested delegation.measurement object unchanged", async () => {
+		const file = path.join(cwd, ".omp", "model-router.json");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				delegation: {
+					enabled: false,
+					plannerTimeoutMs: 45_000,
+					agents: ["scout"],
+					measurement: { enabled: true, sampleRate: 0.5 },
+					note: "keep",
+				},
+			}),
+		);
+		const ui = new FakeUI(
+			["project", "enabled", "No wait — classify every eligible prompt", "@tiny", "done", "none"],
+			["0"],
+			[false, true, true],
+		);
+
+		const result = await runRouterSetup(setupContext(ui), config);
+
+		expect(result.status).toBe("written");
+		const written = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		expect(written.delegation).toEqual({
+			enabled: true,
+			plannerTimeoutMs: 20_000,
+			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+			measurement: { enabled: true, sampleRate: 0.5 },
 			note: "keep",
 		});
 	});

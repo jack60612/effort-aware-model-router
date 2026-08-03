@@ -79,7 +79,11 @@ For example, this is the complete built-in configuration:
   "delegation": {
     "enabled": false,
     "plannerTimeoutMs": 20000,
-    "agents": ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"]
+    "agents": ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+    "measurement": {
+      "enabled": false,
+      "sampleRate": 0.1
+    }
   }
 }
 ```
@@ -94,11 +98,11 @@ For example, this is the complete built-in configuration:
 | `classifierMinPromptChars` | non-negative integer | Skips classification for prompts whose trimmed text is shorter than this value. The default is `30`; `0` disables the minimum. |
 | `classifierCooldownMs` | non-negative integer | Skips classification until this many milliseconds have elapsed since the last classification attempt. The default is `30000` (30 seconds); `0` disables the cooldown. |
 | `thinkingProfiles` | object | Maps an exact `provider/model` identity to `default` and/or classified-effort thinking overrides. Exact effort override wins over `default`, which wins over the classified effort; the result is clamped to the target model's supported thinking metadata. |
-| `delegation` | object | Opt-in subagent delegation; see [Subagent delegation](#subagent-delegation). `enabled` (boolean, default `false`), `plannerTimeoutMs` (positive integer, at most `120000` milliseconds), and `agents` (non-empty string array; a valid array replaces the whole list) merge individually. |
+| `delegation` | object | Opt-in subagent delegation; see [Subagent delegation](#subagent-delegation). `enabled` (boolean, default `false`), `plannerTimeoutMs` (positive integer, at most `120000` milliseconds), and `agents` (non-empty string array; a valid array replaces the whole list) merge individually. The nested `measurement` object — `enabled` (boolean, default `false`) and `sampleRate` (number from `0` to `1`, default `0.1`) — also merges field by field; see [Shadow measurement](#shadow-measurement). |
 
 Unknown fields, unknown threshold names, inherited properties, and invalid field values are ignored. An unreadable file or invalid JSON layer is ignored. Threshold objects merge by valid effort key; omission does not remove a threshold inherited from defaults or an earlier layer. Thinking profiles merge by exact model key and field.
 
-Use `/route setup` for an interactive public-UI wizard that chooses project or user scope, selectable model boxes (including currently configured selectors), fallback ordering, classifier safeguards with human-readable cooldown choices, a model-specific thinking profile, and a delegation on/off toggle (the planner timeout and agent list keep their current values). The wizard does not accept freeform model input; manual JSON remains supported. It writes only after final confirmation, preserves unrelated JSON fields, and reports unsupported in headless contexts. Use `/route reload` after editing a file in a running session. Configuration is also reloaded during session start, switch, branch, and tree lifecycle events.
+Use `/route setup` for an interactive public-UI wizard that chooses project or user scope, selectable model boxes (including currently configured selectors), fallback ordering, classifier safeguards with human-readable cooldown choices, a model-specific thinking profile, and a delegation on/off toggle (the planner timeout and agent list keep their current values). The wizard has no measurement control: an existing `delegation.measurement` object, like any other unknown nested delegation field, passes through a setup write unchanged. The wizard does not accept freeform model input; manual JSON remains supported. It writes only after final confirmation, preserves unrelated JSON fields, and reports unsupported in headless contexts. Use `/route reload` after editing a file in a running session. Configuration is also reloaded during session start, switch, branch, and tree lifecycle events.
 
 ## Subagent delegation
 
@@ -127,13 +131,29 @@ The default agent list is `scout`, `sonic`, `task`, `designer`, `reviewer`, and 
 - **Subagent failure:** a failed or crashed subagent renders a visible failure message, then replays the original prompt once with an appended warning that the failed attempt may have produced side effects.
 - **Cancellation:** `/route cancel`, or session shutdown, aborts the active workflow. A cancelled prompt is **not** replayed, and cancellation does not undo work already performed — a subagent aborted mid-run can leave partial side effects in the working directory.
 
-Every workflow transition is recorded as a `model-router-delegation` state entry with a `pending`, `delegated`, `completed`, `failed`, `cancelled`, or `passed-through` status. Only one delegation workflow runs at a time; text submitted while one is active is handled by the main session as usual.
+Every workflow transition is recorded as a `model-router-delegation` state entry with a `pending`, `delegated`, `completed`, `failed`, `cancelled`, or `passed-through` status, carrying a `measurement` block with the parent context token count plus planner and child usage. [Shadow measurement](#shadow-measurement) appends `shadow` and `measured` entries to the same stream. Only one delegation workflow runs at a time; text submitted while one is active is handled by the main session as usual.
+
+### Shadow measurement
+
+`delegation.measurement` estimates what delegation would cost on prompts that stay on the main path, without changing any user-visible behavior. It is **off by default** and samples at `sampleRate` — default `0.1` — when enabled:
+
+```json
+{
+  "delegation": { "measurement": { "enabled": true, "sampleRate": 0.1 } }
+}
+```
+
+- **Sampling scope:** only prompts that delegation did **not** claim are candidates — interactive main-path prompts with no attached images whose trimmed length is at least `classifierMinPromptChars`. Each candidate is sampled independently at `sampleRate`, and at most one shadow run is active at a time; a sampled prompt that arrives while one is running is recorded as skipped, not queued.
+- **Shadow isolation:** a sampled prompt triggers one detached planning call on the selected route model. The shadow planner never executes a child subagent and never forwards parent conversation context — like the real planner, it sees only the prompt text, the eligible agent list, and the bounded repository index. The main-session turn proceeds untouched.
+- **Usage fields:** planner, child, and parent usage snapshots each report input, output, cache-read, and cache-write tokens, the token total, and the provider-reported cost when the provider reports one; unreported values stay `null`. The main-path turn that follows a shadow run (or the replayed turn after a pass-through) is correlated afterwards as a `measured` entry carrying `parentUsage`.
+
+Measurement never affects routing, delegation, or replay: a failed or cancelled shadow run only logs a warning and records its outcome.
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
-| `/route` or `/route status` | Show the current mode, baseline, and last decision, plus whether delegation is on or off and whether a workflow is active or idle, in the status area and a notification. |
+| `/route` or `/route status` | Show the current mode, baseline, and last decision, plus whether delegation is on or off, whether a workflow is active or idle, and whether measurement is on — with its sample rate as a percentage — or off, in the status area and a notification. |
 | `/route explain` | Explain the latest decision, including ordered candidates, per-candidate outcomes, selected candidate, thinking profile, and fallback reason. |
 | `/route history` | Show the bounded history of recent routing decisions. |
 | `/route once <selector>` | Resolve and arm one selector for the next eligible prompt. This bypasses auto/manual mode, the classifier minimum, and cooldown once, then consumes itself. |
@@ -148,9 +168,9 @@ Every workflow transition is recorded as a `model-router-delegation` state entry
 
 Other slash commands are not classified. In particular, normal `/model <selector>` commands remain OMP commands rather than router commands.
 
-`/route reload` and the automatic lifecycle reloads re-read the JSON configuration layers only. Extension source is loaded once at OMP process start: after changing or upgrading the extension code, restart OMP — `/route reload` cannot load new code into a running process. In the current source every slash command, including `/usage`, bypasses the router before any classifier, planner, or delegation work; if `/usage` still appears blocked by the router, that session is an already-running process executing an old build, and restarting OMP is the fix.
+`/route reload` and the automatic lifecycle reloads re-read the JSON configuration layers only — this includes turning `delegation.measurement` on or off and changing its sample rate. Extension source is loaded once at OMP process start: after changing or upgrading the extension code, restart OMP — `/route reload` cannot load new code into a running process. In the current source every slash command, including `/usage`, bypasses the router before any classifier, planner, or delegation work, so `/usage` remains OMP's own command outside the router; if `/usage` still appears blocked by the router, that session is an already-running process executing an old build, and restarting OMP is the fix.
 
-The setup wizard writes either the project file `<cwd>/.omp/model-router.json` or the user file `~/.omp/agent/model-router.json`, depending on the selected scope. Existing router fields are updated while unrelated top-level fields and unknown nested threshold/profile fields are preserved.
+The setup wizard writes either the project file `<cwd>/.omp/model-router.json` or the user file `~/.omp/agent/model-router.json`, depending on the selected scope. Existing router fields are updated while unrelated top-level fields and unknown nested threshold, profile, and delegation fields — including `delegation.measurement` — are preserved.
 
 ## Manual model changes and same-model ambiguity
 
