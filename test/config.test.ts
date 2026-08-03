@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, parseRouterConfigLayer, type RouterConfigLayer } from "../src/config";
+import {
+	DEFAULT_DELEGATION_AGENTS,
+	DEFAULT_ROUTER_CONFIG,
+	loadRouterConfig,
+	parseRouterConfigLayer,
+	type RouterConfigLayer,
+} from "../src/config";
 
 let root: string;
 let homeDir: string;
@@ -38,9 +44,16 @@ describe("loadRouterConfig", () => {
 			classifierMinPromptChars: 30,
 			classifierCooldownMs: 30_000,
 			thinkingProfiles: {},
+			delegation: {
+				enabled: false,
+				plannerTimeoutMs: 20_000,
+				agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+			},
 		});
 		expect(config).not.toBe(DEFAULT_ROUTER_CONFIG);
 		expect(config.thresholds).not.toBe(DEFAULT_ROUTER_CONFIG.thresholds);
+		expect(config.delegation).not.toBe(DEFAULT_ROUTER_CONFIG.delegation);
+		expect(config.delegation.agents).not.toBe(DEFAULT_ROUTER_CONFIG.delegation.agents);
 	});
 
 	it("layers user, project, and explicit config in that order", async () => {
@@ -83,6 +96,11 @@ describe("loadRouterConfig", () => {
 			classifierMinPromptChars: 30,
 			classifierCooldownMs: 30_000,
 			thinkingProfiles: {},
+			delegation: {
+				enabled: false,
+				plannerTimeoutMs: 20_000,
+				agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+			},
 		});
 	});
 
@@ -112,6 +130,23 @@ describe("loadRouterConfig", () => {
 		});
 		expect(config.classifierMinPromptChars).toBe(10);
 		expect(config.classifierCooldownMs).toBe(1_000);
+	});
+
+	it("overrides individual delegation fields per layer without erasing unchanged fields", async () => {
+		await writeJson(path.join(homeDir, ".omp", "agent", "model-router.json"), {
+			delegation: { enabled: true, plannerTimeoutMs: 60_000, agents: ["scout"] },
+		});
+		await writeJson(path.join(cwd, ".omp", "model-router.json"), {
+			delegation: { plannerTimeoutMs: 30_000 },
+		});
+
+		const config = await loadRouterConfig({ cwd, homeDir, env: {} });
+
+		expect(config.delegation).toEqual({
+			enabled: true,
+			plannerTimeoutMs: 30_000,
+			agents: ["scout"],
+		});
 	});
 
 	it("ignores missing, malformed, and non-object config files", async () => {
@@ -238,5 +273,64 @@ describe("parseRouterConfigLayer", () => {
 				classifierCooldownMs: Number.POSITIVE_INFINITY,
 			}),
 		).toEqual({});
+	});
+
+	it("parses valid own delegation fields with the exact defaults exported", () => {
+		expect(DEFAULT_ROUTER_CONFIG.delegation).toEqual({
+			enabled: false,
+			plannerTimeoutMs: 20_000,
+			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+		});
+		expect(DEFAULT_DELEGATION_AGENTS).toEqual([
+			"scout",
+			"sonic",
+			"task",
+			"designer",
+			"reviewer",
+			"security-reviewer",
+		]);
+
+		expect(
+			parseRouterConfigLayer({
+				delegation: { enabled: true, plannerTimeoutMs: 45_000, agents: [" scout ", "task"] },
+			}),
+		).toEqual({
+			delegation: { enabled: true, plannerTimeoutMs: 45_000, agents: ["scout", "task"] },
+		});
+	});
+
+	it("accepts partial delegation layers without inventing sibling fields", () => {
+		expect(parseRouterConfigLayer({ delegation: { plannerTimeoutMs: 30_000 } })).toEqual({
+			delegation: { plannerTimeoutMs: 30_000 },
+		});
+		expect(parseRouterConfigLayer({ delegation: { enabled: false } })).toEqual({
+			delegation: { enabled: false },
+		});
+	});
+
+	it("ignores invalid delegation roots and inherited delegation properties", () => {
+		expect(parseRouterConfigLayer({ delegation: null })).toEqual({});
+		expect(parseRouterConfigLayer({ delegation: [] })).toEqual({});
+		expect(parseRouterConfigLayer({ delegation: "on" })).toEqual({});
+
+		const inherited = { enabled: true, agents: ["scout"] };
+		const delegation = Object.create(inherited) as Record<string, unknown>;
+		delegation.plannerTimeoutMs = 15_000;
+
+		expect(parseRouterConfigLayer({ delegation })).toEqual({
+			delegation: { plannerTimeoutMs: 15_000 },
+		});
+	});
+
+	it("rejects empty agent lists and out-of-bounds planner timeouts", () => {
+		expect(parseRouterConfigLayer({ delegation: { agents: [] } })).toEqual({ delegation: {} });
+		expect(parseRouterConfigLayer({ delegation: { agents: ["", "  ", 42] } })).toEqual({ delegation: {} });
+
+		for (const plannerTimeoutMs of [0, -1, 1.5, 120_001, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(parseRouterConfigLayer({ delegation: { plannerTimeoutMs } })).toEqual({ delegation: {} });
+		}
+		expect(parseRouterConfigLayer({ delegation: { plannerTimeoutMs: 120_000 } })).toEqual({
+			delegation: { plannerTimeoutMs: 120_000 },
+		});
 	});
 });

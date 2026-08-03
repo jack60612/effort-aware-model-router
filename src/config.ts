@@ -11,6 +11,23 @@ export type RouterThresholds = Partial<Record<RouteEffort, readonly string[]>>;
 export type RouterThinkingProfile = Partial<Record<"default" | RouteEffort, RouterThinkingEffort>>;
 export type RouterThinkingProfiles = Record<string, RouterThinkingProfile>;
 
+export const DEFAULT_DELEGATION_AGENTS = [
+	"scout",
+	"sonic",
+	"task",
+	"designer",
+	"reviewer",
+	"security-reviewer",
+] as const;
+
+export interface RouterDelegationConfig {
+	enabled: boolean;
+	plannerTimeoutMs: number;
+	agents: readonly string[];
+}
+
+export const MAX_DELEGATION_PLANNER_TIMEOUT_MS = 120_000;
+
 export interface RouterConfig {
 	enabled: boolean;
 	thresholds: RouterThresholds;
@@ -20,11 +37,13 @@ export interface RouterConfig {
 	classifierMinPromptChars: number;
 	classifierCooldownMs: number;
 	thinkingProfiles: RouterThinkingProfiles;
+	delegation: RouterDelegationConfig;
 }
 
-export type RouterConfigLayer = Partial<Omit<RouterConfig, "thresholds" | "thinkingProfiles">> & {
+export type RouterConfigLayer = Partial<Omit<RouterConfig, "thresholds" | "thinkingProfiles" | "delegation">> & {
 	thresholds?: Partial<Record<RouteEffort, RouterThresholdInput>>;
 	thinkingProfiles?: RouterThinkingProfiles;
+	delegation?: Partial<RouterDelegationConfig>;
 };
 
 export interface LoadRouterConfigOptions {
@@ -45,6 +64,11 @@ export const DEFAULT_ROUTER_CONFIG: Readonly<RouterConfig> = Object.freeze({
 	classifierMinPromptChars: 30,
 	classifierCooldownMs: 30_000,
 	thinkingProfiles: Object.freeze({}),
+	delegation: Object.freeze({
+		enabled: false,
+		plannerTimeoutMs: 20_000,
+		agents: Object.freeze([...DEFAULT_DELEGATION_AGENTS]),
+	}),
 });
 
 function hasOwn(record: object, key: PropertyKey): boolean {
@@ -170,6 +194,33 @@ export function parseRouterConfigLayer(value: unknown): RouterConfigLayer {
 		layer.thinkingProfiles = profiles;
 	}
 
+	if (
+		hasOwn(input, "delegation") &&
+		typeof input.delegation === "object" &&
+		input.delegation !== null &&
+		!Array.isArray(input.delegation)
+	) {
+		const inputDelegation = input.delegation as Record<string, unknown>;
+		const delegation: Partial<RouterDelegationConfig> = {};
+		if (hasOwn(inputDelegation, "enabled") && typeof inputDelegation.enabled === "boolean") {
+			delegation.enabled = inputDelegation.enabled;
+		}
+		if (
+			hasOwn(inputDelegation, "plannerTimeoutMs") &&
+			typeof inputDelegation.plannerTimeoutMs === "number" &&
+			Number.isSafeInteger(inputDelegation.plannerTimeoutMs) &&
+			inputDelegation.plannerTimeoutMs > 0 &&
+			inputDelegation.plannerTimeoutMs <= MAX_DELEGATION_PLANNER_TIMEOUT_MS
+		) {
+			delegation.plannerTimeoutMs = inputDelegation.plannerTimeoutMs;
+		}
+		if (hasOwn(inputDelegation, "agents")) {
+			const agents = cleanSelectors(inputDelegation.agents);
+			if (agents !== undefined) delegation.agents = agents;
+		}
+		layer.delegation = delegation;
+	}
+
 	return layer;
 }
 
@@ -210,6 +261,11 @@ function mergeConfig(base: RouterConfig, layer: RouterConfigLayer): RouterConfig
 		classifierMinPromptChars: layer.classifierMinPromptChars ?? base.classifierMinPromptChars,
 		classifierCooldownMs: layer.classifierCooldownMs ?? base.classifierCooldownMs,
 		thinkingProfiles,
+		delegation: {
+			enabled: layer.delegation?.enabled ?? base.delegation.enabled,
+			plannerTimeoutMs: layer.delegation?.plannerTimeoutMs ?? base.delegation.plannerTimeoutMs,
+			agents: [...(layer.delegation?.agents ?? base.delegation.agents)],
+		},
 	};
 }
 
@@ -238,6 +294,11 @@ export async function loadRouterConfig(options: LoadRouterConfigOptions = {}): P
 		classifierMinPromptChars: DEFAULT_ROUTER_CONFIG.classifierMinPromptChars,
 		classifierCooldownMs: DEFAULT_ROUTER_CONFIG.classifierCooldownMs,
 		thinkingProfiles: {},
+		delegation: {
+			enabled: DEFAULT_ROUTER_CONFIG.delegation.enabled,
+			plannerTimeoutMs: DEFAULT_ROUTER_CONFIG.delegation.plannerTimeoutMs,
+			agents: [...DEFAULT_ROUTER_CONFIG.delegation.agents],
+		},
 	};
 	for (const file of files) {
 		config = mergeConfig(config, await readConfigLayer(file));

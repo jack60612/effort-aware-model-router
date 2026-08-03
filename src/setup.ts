@@ -5,6 +5,7 @@ import {
 	ROUTER_EFFORTS,
 	type RouteEffort,
 	type RouterConfig,
+	type RouterDelegationConfig,
 	type RouterThinkingEffort,
 	type RouterThinkingProfiles,
 	type RouterThresholds,
@@ -38,6 +39,7 @@ export interface RouterSetupValues {
 	classifierMinPromptChars: number;
 	classifierCooldownMs: number;
 	thinkingProfiles: RouterThinkingProfiles;
+	delegation: RouterDelegationConfig;
 }
 
 export interface RouterSetupFileSystem {
@@ -211,6 +213,14 @@ export async function writeRouterConfigLayer(
 		classifierMinPromptChars: values.classifierMinPromptChars,
 		classifierCooldownMs: values.classifierCooldownMs,
 		thinkingProfiles: mergedProfiles,
+		delegation: {
+			...(typeof existing.delegation === "object" && existing.delegation !== null && !Array.isArray(existing.delegation)
+				? (existing.delegation as Record<string, unknown>)
+				: {}),
+			enabled: values.delegation.enabled,
+			plannerTimeoutMs: values.delegation.plannerTimeoutMs,
+			agents: [...values.delegation.agents],
+		},
 	};
 	await fileSystem.mkdir(path.dirname(file));
 	await fileSystem.writeFile(file, `${JSON.stringify(output, null, 2)}\n`);
@@ -356,6 +366,11 @@ export async function runRouterSetup(
 		thinkingProfiles[normalizedModel] = profile;
 	}
 
+	const delegationEnabled = await context.ui.confirm(
+		"Enable self-contained subagent delegation?",
+		`Currently ${config.delegation.enabled ? "enabled" : "disabled"}. When enabled, the routed model plans eligible requests and runs them through a subagent.`,
+	);
+
 	const values: RouterSetupValues = {
 		enabled: enabledChoice === "enabled",
 		thresholds,
@@ -363,6 +378,11 @@ export async function runRouterSetup(
 		classifierMinPromptChars,
 		classifierCooldownMs,
 		thinkingProfiles,
+		delegation: {
+			enabled: delegationEnabled,
+			plannerTimeoutMs: config.delegation.plannerTimeoutMs,
+			agents: [...config.delegation.agents],
+		},
 	};
 	const summary = JSON.stringify(values, null, 2);
 	if (!(await context.ui.confirm("Write model router configuration?", summary))) return { status: "cancelled" };
