@@ -252,11 +252,15 @@ export function createModelRouterExtension(
 		let state: RouterState | undefined;
 		let activeDelegation: DelegationWorkflow | undefined;
 		let delegationRunSequence = 0;
+		const delegationStatus = (): string =>
+			`delegation ${config.delegation.enabled ? "on" : "off"} (${activeDelegation ? "active" : "idle"})`;
+		/** The one status-bar string: route summary plus the delegation suffix, everywhere. */
+		const routerStatus = (runtime: RouterState): string => `${routeStatus(runtime)} · ${delegationStatus()}`;
 
 		const persist = (ctx: ExtensionContext): void => {
 			if (!state) return;
 			pi.appendEntry(MODEL_ROUTER_STATE_ENTRY, encodeRouterState(state));
-			ctx.ui.setStatus(STATUS_KEY, routeStatus(state));
+			ctx.ui.setStatus(STATUS_KEY, routerStatus(state));
 		};
 		const switchModel = async (model: Model): Promise<boolean> => {
 			try {
@@ -309,14 +313,14 @@ export function createModelRouterExtension(
 				changed = true;
 			}
 			if (!restored || changed) persist(ctx);
-			else ctx.ui.setStatus(STATUS_KEY, routeStatus(state));
+			else ctx.ui.setStatus(STATUS_KEY, routerStatus(state));
 		};
 
 		const transitionAuto = (ctx: ExtensionContext): void => {
 			const runtime = ensureState(ctx);
 			const current = identityOf(currentModel(ctx));
 			if (runtime.mode === "auto" && modelsEqual(runtime.baseline ?? undefined, current ?? undefined)) {
-				ctx.ui.setStatus(STATUS_KEY, routeStatus(runtime));
+				ctx.ui.setStatus(STATUS_KEY, routerStatus(runtime));
 				return;
 			}
 			runtime.mode = "auto";
@@ -443,10 +447,7 @@ export function createModelRouterExtension(
 			persist(ctx);
 		};
 
-		const applyRoutePrompt = async (
-			event: InputEvent,
-			ctx: ExtensionContext,
-		): Promise<RoutedPrompt | undefined> => {
+		const applyRoutePrompt = async (event: InputEvent, ctx: ExtensionContext): Promise<RoutedPrompt | undefined> => {
 			const runtime = ensureState(ctx);
 			const oneShotSelector = runtime.oneShotSelector;
 			if (oneShotSelector === undefined && runtime.mode !== "auto") return;
@@ -612,9 +613,6 @@ export function createModelRouterExtension(
 			);
 			return run;
 		};
-
-		const delegationStatus = (): string =>
-			`delegation ${config.delegation.enabled ? "on" : "off"} (${activeDelegation ? "active" : "idle"})`;
 
 		const releaseDelegation = (runId: string): void => {
 			if (activeDelegation?.runId === runId) activeDelegation = undefined;
@@ -802,7 +800,7 @@ export function createModelRouterExtension(
 				}
 				if (command === "status" && parts.length === 1) {
 					const runtime = ensureState(ctx);
-					const status = `${routeStatus(runtime)} · ${delegationStatus()}`;
+					const status = routerStatus(runtime);
 					ctx.ui.setStatus(STATUS_KEY, status);
 					ctx.ui.notify(status, "info");
 					return;
@@ -812,9 +810,7 @@ export function createModelRouterExtension(
 						ctx.ui.notify("Model router has no active delegation workflow", "info");
 						return;
 					}
-					activeDelegation.controller.abort(
-						new Error("model-router: delegation cancelled by /route cancel"),
-					);
+					activeDelegation.controller.abort(new Error("model-router: delegation cancelled by /route cancel"));
 					ctx.ui.notify("Model router delegation workflow cancelled", "info");
 					return;
 				}
@@ -865,7 +861,7 @@ export function createModelRouterExtension(
 							runtime.mode = "off";
 							persist(ctx);
 						} else {
-							ctx.ui.setStatus(STATUS_KEY, routeStatus(runtime));
+							ctx.ui.setStatus(STATUS_KEY, routerStatus(runtime));
 						}
 					}
 					return;
@@ -877,7 +873,7 @@ export function createModelRouterExtension(
 						runtime.mode = "off";
 						persist(ctx);
 					} else {
-						ctx.ui.setStatus(STATUS_KEY, routeStatus(runtime));
+						ctx.ui.setStatus(STATUS_KEY, routerStatus(runtime));
 					}
 					ctx.ui.notify("Model router configuration reloaded", "info");
 					return;
@@ -905,7 +901,10 @@ export function createModelRouterExtension(
 				typeof message.content === "string"
 					? message.content
 					: message.content
-							.filter((part): part is Extract<(typeof message.content)[number], { type: "text" }> => part.type === "text")
+							.filter(
+								(part): part is Extract<(typeof message.content)[number], { type: "text" }> =>
+									part.type === "text",
+							)
 							.map(part => part.text)
 							.join("\n");
 			return new Text(content);

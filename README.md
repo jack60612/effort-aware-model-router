@@ -125,7 +125,7 @@ The default agent list is `scout`, `sonic`, `task`, `designer`, `reviewer`, and 
 - **Pass-through:** when the planner declines, or no automatic route was applied, the original prompt is replayed once, in order, as a normal main-session follow-up. The replay is not planned again.
 - **Planner failure:** a planner timeout, unparseable plan, unavailable planned agent, or empty planned task also replays the original prompt once as a follow-up.
 - **Subagent failure:** a failed or crashed subagent renders a visible failure message, then replays the original prompt once with an appended warning that the failed attempt may have produced side effects.
-- **Cancellation:** `/route cancel`, or session shutdown, aborts the active workflow. A cancelled prompt is **not** replayed.
+- **Cancellation:** `/route cancel`, or session shutdown, aborts the active workflow. A cancelled prompt is **not** replayed, and cancellation does not undo work already performed — a subagent aborted mid-run can leave partial side effects in the working directory.
 
 Every workflow transition is recorded as a `model-router-delegation` state entry with a `pending`, `delegated`, `completed`, `failed`, `cancelled`, or `passed-through` status. Only one delegation workflow runs at a time; text submitted while one is active is handled by the main session as usual.
 

@@ -156,7 +156,9 @@ describe("buildDelegationSystemPrompt", () => {
 
 	it("contains the decision rule and both JSON examples without a code fence", () => {
 		const prompt = buildDelegationSystemPrompt(baseAgents, "");
-		expect(prompt).toContain("Delegate only when the current request is independently executable without prior conversation.");
+		expect(prompt).toContain(
+			"Delegate only when the current request is independently executable without prior conversation.",
+		);
 		expect(prompt).toContain('{"delegate":true,"agent":"name","task":"complete standalone assignment"}');
 		expect(prompt).toContain('{"delegate":false,"reason":"short reason"}');
 		expect(prompt).toContain("no code fence");
@@ -325,12 +327,12 @@ describe("planDelegation", () => {
 		expect(optionsSignal?.aborted).toBe(true);
 	});
 
-	it("extracts text across multiple text blocks and applies strict parsing", async () => {
+	it("extracts text across multiple text blocks without injecting separators", async () => {
 		const complete: ClassifierComplete = async () =>
 			response("", {
 				content: [
-					{ type: "text", text: '{"delegate":false,' },
-					{ type: "text", text: '"reason":"needs prior context"}' },
+					{ type: "text", text: '{"delegate":false,"reason":"needs pri' },
+					{ type: "text", text: 'or context"}' },
 				],
 			});
 
@@ -414,6 +416,34 @@ describe("planDelegation", () => {
 				timeoutSignal: () => new AbortController().signal,
 			}),
 		).rejects.toThrow("unparseable delegation plan");
+	});
+
+	it("truncates raw planner output in the parse-error diagnostic", async () => {
+		const oversized = `not json ${"x".repeat(1_000)}`;
+
+		const error = await planDelegation(
+			"task",
+			plannerModel("planner"),
+			baseAgents,
+			"",
+			baseConfig,
+			plannerContext(),
+			{
+				complete: async () => response(oversized),
+				now: () => 1,
+				timeoutSignal: () => new AbortController().signal,
+			},
+		).then(
+			() => undefined,
+			(reason: unknown) => reason,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain("unparseable delegation plan");
+		expect(message).toContain("…");
+		expect(message).not.toContain(oversized);
+		expect(message.length).toBeLessThan(300);
 	});
 
 	it("rejects on caller cancellation", async () => {

@@ -1,10 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
-	ImageContent,
 	InputEvent,
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent";
@@ -1082,7 +1081,8 @@ describe("model router delegation", () => {
 		expect(call?.agent).toBe(harness.discoveredAgents[0] as AgentDefinition);
 		expect(call?.task).toBe("standalone task assignment");
 		expect(call?.modelOverride).toBe("mock/smol");
-		expect(call?.thinkingLevel).toBe("low");
+		const thinkingLevel: string | undefined = call?.thinkingLevel;
+		expect(thinkingLevel).toBe("low");
 		expect(call?.cwd).toBe("/project");
 		expect(typeof call?.id).toBe("string");
 		expect(call?.id.length).toBeGreaterThan(0);
@@ -1102,11 +1102,7 @@ describe("model router delegation", () => {
 		expect(harness.customMessages[0]?.content).toContain("summarize the repository layout");
 		expect(harness.customMessages[0]?.details).toMatchObject({ agent: "scout" });
 		expect(harness.userMessages).toEqual([]);
-		expect(harness.delegationEntries().map(entry => entry.status)).toEqual([
-			"pending",
-			"delegated",
-			"completed",
-		]);
+		expect(harness.delegationEntries().map(entry => entry.status)).toEqual(["pending", "delegated", "completed"]);
 	});
 
 	it("renders child failure then replays a guarded follow-up", async () => {

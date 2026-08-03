@@ -8,15 +8,15 @@ import type { RouterDelegationConfig } from "./config";
 export const DELEGATION_PLANNER_MAX_TOKENS = 2_048;
 /** Fixed character cap for the AGENTS.md repository index. */
 export const REPOSITORY_AGENT_INDEX_MAX_CHARS = 4_000;
+/** Character cap for raw planner output quoted in the unparseable-plan diagnostic. */
+const PARSE_ERROR_EXCERPT_MAX_CHARS = 200;
 
 export interface DelegationAgentOption {
 	name: string;
 	description?: string;
 }
 
-export type DelegationPlan =
-	| { delegate: false; reason: string }
-	| { delegate: true; agent: string; task: string };
+export type DelegationPlan = { delegate: false; reason: string } | { delegate: true; agent: string; task: string };
 
 export type DelegationPlannerConfig = Pick<RouterDelegationConfig, "plannerTimeoutMs">;
 
@@ -177,7 +177,9 @@ export async function planDelegation(
 	const text = extractText(response.content);
 	const plan = parseDelegationPlan(text, new Set(agents.map(agent => agent.name)));
 	if (!plan) {
-		throw new Error(`model-router: unparseable delegation plan: ${JSON.stringify(text)}`);
+		const excerpt =
+			text.length > PARSE_ERROR_EXCERPT_MAX_CHARS ? `${text.slice(0, PARSE_ERROR_EXCERPT_MAX_CHARS)}…` : text;
+		throw new Error(`model-router: unparseable delegation plan: ${JSON.stringify(excerpt)}`);
 	}
 	return plan;
 }
@@ -186,6 +188,6 @@ function extractText(content: AssistantMessage["content"]): string {
 	return content
 		.filter((block): block is Extract<(typeof content)[number], { type: "text" }> => block.type === "text")
 		.map(block => block.text)
-		.join(" ")
+		.join("")
 		.trim();
 }

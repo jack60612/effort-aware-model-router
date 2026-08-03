@@ -214,7 +214,9 @@ export async function writeRouterConfigLayer(
 		classifierCooldownMs: values.classifierCooldownMs,
 		thinkingProfiles: mergedProfiles,
 		delegation: {
-			...(typeof existing.delegation === "object" && existing.delegation !== null && !Array.isArray(existing.delegation)
+			...(typeof existing.delegation === "object" &&
+			existing.delegation !== null &&
+			!Array.isArray(existing.delegation)
 				? (existing.delegation as Record<string, unknown>)
 				: {}),
 			enabled: values.delegation.enabled,
