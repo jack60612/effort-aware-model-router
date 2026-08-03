@@ -77,7 +77,7 @@ flowchart TD
     H -- yes --> I[Persist skip; no provider call]
     H -- no --> J[Persist planner usage and decision]
     J --> M
-    M --> K[turn_end captures parent usage when available]
+    M --> K[message_end and agent_end capture parent usage when available]
     C --> L{Replay?}
     L -- yes --> K
     L -- no --> N[Persist planner/child usage]
@@ -104,9 +104,11 @@ A planner decline, timeout, malformed response, missing agent, child failure, ca
 
 ### Parent turn usage
 
-Register the public `turn_end` extension hook. For a sampled main-path prompt or a delegated workflow that replays the original request, enqueue a short-lived run identifier before the main turn can begin. The next parent assistant `turn_end` consumes the FIFO item and records its usage snapshot. Session branch/tree/switch and shutdown lifecycle events clear pending identifiers so a later turn cannot be attributed to an earlier session. If no assistant usage is available, the record stores `null` and the main path continues.
+Register the public `message_end` and `agent_end` extension hooks. For a sampled main-path prompt or a delegated workflow that replays the original request, create a short-lived in-memory correlation before the main turn can begin. It first waits for a `message_end` user message whose text equals the sampled prompt or starts with the replayed original request. Only after that confirmation does it collect usage from subsequent assistant `message_end` events.
 
-This is best-effort correlation. The parent context estimate remains the authoritative size signal; the turn-end usage is an observed cost signal when OMP emits it.
+When `agent_end` arrives with `willContinue !== true`, append the aggregate assistant usage snapshot to the measured run and clear the correlation. An `agent_end` with `willContinue: true` keeps the correlation open across an automatic retry or continuation. The correlation expires after five minutes if the queued user message or terminal agent event never arrives. Session branch/tree/switch and shutdown lifecycle events clear all pending correlations so a later turn cannot be attributed to an earlier session. If no assistant usage is available, the record stores `null` and the main path continues.
+
+This avoids correlating by the first `turn_end`: that event has no run identifier and a single logical prompt can contain tool turns, retries, and multiple assistant messages. The parent context estimate remains the authoritative size signal; the aggregated assistant usage is an observed cost signal when OMP emits it.
 
 ## Usage contract
 
@@ -123,7 +125,7 @@ interface UsageSnapshot {
 }
 ```
 
-Planner `AssistantMessage.usage`, child `SingleResult.usage`, and parent assistant `turn_end` usage all use this normalizer. A helper aggregates snapshots only when both values are known; it never treats an unknown value as zero for a field that was not reported. Provider-reported `cost.total` is copied without recomputing prices.
+Planner `AssistantMessage.usage`, child `SingleResult.usage`, and parent assistant `message_end` usage all use this normalizer. A helper aggregates snapshots only when both values are known; it never treats an unknown value as zero for a field that was not reported. Provider-reported `cost.total` is copied without recomputing prices.
 
 Measurement records use the existing state-only delegation entry type and a distinct `status: "shadow"` for shadow results. New metadata is compact and excludes request text, planner reasoning, child task text, and result output. Existing delegation records retain their current request/task fields for backwards compatibility; this slice does not widen those fields.
 
@@ -133,7 +135,7 @@ A shadow record includes:
 - model identity and parent context-token estimate;
 - sample rate and planner usage snapshot;
 - selected agent name and task character count only when the plan delegates;
-- parent usage snapshot when the corresponding `turn_end` arrives.
+- parent usage snapshot when the corresponding `agent_end` arrives.
 
 A delegated workflow record includes the same usage fields plus the existing agent/task/model/status data. All usage fields are nullable.
 
@@ -164,7 +166,7 @@ A delegated workflow record includes the same usage fields plus the existing age
 - A shadow delegate decision never executes a child or sends a visible result.
 - Delegated planner and child usage snapshots appear in state metadata when supplied.
 - Missing usage and shadow failures are fail-open.
-- `turn_end` attaches parent usage to the pending measured run; session switch/shutdown clears pending correlation.
+- `message_end`/`agent_end` attaches parent usage to the pending measured run; session switch/shutdown clears pending correlation.
 - Existing successful, replay, failure, cancellation, slash-command, and `/usage` behavior remains unchanged.
 
 ### Smoke checks
