@@ -135,6 +135,8 @@ interface DelegationWorkflow {
 	controller: AbortController;
 	request: string;
 	startedAt: number;
+	/** Delegation generation captured at claim; a lifecycle bump orphans the workflow. */
+	generation: number;
 	parentContextTokens: number | null;
 	plannerUsage: UsageSnapshot | null;
 	childUsage: UsageSnapshot | null;
@@ -297,6 +299,8 @@ export function createModelRouterExtension(
 		let state: RouterState | undefined;
 		let activeDelegation: DelegationWorkflow | undefined;
 		let delegationRunSequence = 0;
+		/** Bumped on session start/switch/branch/tree so an in-flight workflow can never write into a successor session. */
+		let delegationGeneration = 0;
 		let shadowRunSequence = 0;
 		let shadowController: AbortController | undefined;
 		/** Bumped on every session reset so a stale detached shadow can never append into a successor session. */
@@ -676,6 +680,20 @@ export function createModelRouterExtension(
 			if (state) ctx.ui.setStatus(STATUS_KEY, routerStatus(state));
 		};
 
+		/**
+		 * Session lifecycle fence: orphan the in-flight workflow so none of its
+		 * record/replay/message paths can reach the successor session. Unlike
+		 * `/route cancel` and shutdown, an invalidated workflow records nothing —
+		 * not even a `cancelled` entry.
+		 */
+		const invalidateDelegation = (reason: string): void => {
+			delegationGeneration += 1;
+			const stale = activeDelegation;
+			if (!stale) return;
+			activeDelegation = undefined;
+			stale.controller.abort(new Error(reason));
+		};
+
 		/** Measurement metadata must never fail routing, delegation, or replay. */
 		const appendMeasurementEntry = (data: Record<string, unknown>): void => {
 			try {
@@ -729,7 +747,10 @@ export function createModelRouterExtension(
 			workflow: DelegationWorkflow,
 		): Promise<void> => {
 			const { runId, controller } = workflow;
+			/** True once a session lifecycle reset orphaned this workflow; every append/replay/message path bails. */
+			const invalidated = (): boolean => workflow.generation !== delegationGeneration;
 			const record = (status: DelegationEntryStatus, detail: Record<string, unknown> = {}): void => {
+				if (invalidated()) return;
 				pi.appendEntry(MODEL_ROUTER_DELEGATION_ENTRY, {
 					status,
 					runId,
@@ -747,6 +768,7 @@ export function createModelRouterExtension(
 				record("cancelled", { reason: String(controller.signal.reason ?? "cancelled"), ...detail });
 			};
 			const replayOriginal = (status: DelegationEntryStatus, reason: string): void => {
+				if (invalidated()) return;
 				record(status, { reason });
 				releaseDelegation(runId, ctx);
 				armParentMeasurement(runId, workflow.request, "prefix");
@@ -754,7 +776,7 @@ export function createModelRouterExtension(
 			};
 			let delegated: { agent: AgentDefinition; task: string; model: string } | undefined;
 			const childFailure = (rawReason: string): void => {
-				if (!delegated) return;
+				if (!delegated || invalidated()) return;
 				const reason = conciseReason(rawReason);
 				record("failed", { agent: delegated.agent.name, task: delegated.task, model: delegated.model, reason });
 				pi.sendMessage(
@@ -821,7 +843,7 @@ export function createModelRouterExtension(
 					keepAlive: false,
 				});
 				workflow.childUsage = snapshotUsage(result.usage);
-				if (controller.signal.aborted) return cancelled({ agent: definition.name });
+				if (controller.signal.aborted || invalidated()) return cancelled({ agent: definition.name });
 				if (result.aborted) {
 					return childFailure(result.abortReason ?? result.error ?? "subagent aborted before completion");
 				}
@@ -868,6 +890,7 @@ export function createModelRouterExtension(
 				runId: `model-router-delegation-${delegationRunSequence}`,
 				index: delegationRunSequence,
 				controller: new AbortController(),
+				generation: delegationGeneration,
 				request: event.text,
 				startedAt: now(),
 				parentContextTokens: ctx.getContextUsage()?.tokens ?? null,
@@ -964,9 +987,9 @@ export function createModelRouterExtension(
 					}
 				} catch (error) {
 					if (controller.signal.aborted) return recordShadow("cancelled");
-					const reason = conciseReason(error);
-					pi.logger.warn(`model-router: shadow measurement ${runId} failed: ${reason}`);
-					recordShadow("failed", { reason });
+					pi.logger.warn(`model-router: shadow measurement ${runId} failed: ${conciseReason(error)}`);
+					// Planner failures can quote raw planner output; persisted shadow metadata stays metadata-only.
+					recordShadow("failed", { reason: error instanceof Error ? error.name : typeof error });
 				} finally {
 					if (shadowController === controller) shadowController = undefined;
 				}
@@ -1080,10 +1103,12 @@ export function createModelRouterExtension(
 			_event: SessionStartEvent | SessionBranchEvent | SessionTreeEvent,
 			ctx: ExtensionContext,
 		): Promise<void> => {
+			invalidateDelegation("model-router: delegation invalidated by session lifecycle");
 			resetMeasurement("model-router: shadow cancelled by session lifecycle");
 			return rehydrate(ctx);
 		};
 		const handleSessionSwitch = (_event: SessionSwitchEvent, ctx: ExtensionContext): Promise<void> => {
+			invalidateDelegation("model-router: delegation invalidated by session switch");
 			resetMeasurement("model-router: shadow cancelled by session switch");
 			return rehydrate(ctx, true);
 		};

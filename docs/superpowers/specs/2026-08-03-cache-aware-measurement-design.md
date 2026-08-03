@@ -100,7 +100,7 @@ The current standalone workflow remains behaviorally identical. Its measurement 
 - child usage, if a subprocess ran and returned provider usage;
 - terminal outcome, elapsed time, selected model/agent, and replay status.
 
-A planner decline, timeout, malformed response, missing agent, child failure, cancellation, or successful child result follows the existing recovery path. Measurement is attached to the corresponding state records and does not decide recovery.
+A planner decline, timeout, malformed response, missing agent, child failure, same-session cancellation (`/route cancel` or shutdown), or successful child result follows the existing recovery path. Measurement is attached to the corresponding state records and does not decide recovery. A session start/switch/branch/tree lifecycle event instead invalidates the in-flight workflow: it is aborted and suppressed, so it appends no entry (not even `cancelled`), sends no result message, replays nothing, and arms no parent correlation in the successor session.
 
 ### Parent turn usage
 
@@ -131,7 +131,7 @@ Measurement records use the existing state-only delegation entry type and a dist
 
 A shadow record includes:
 
-- `runId`, start time, terminal outcome (`completed`, `declined`, `skipped`, `failed`, or `cancelled`);
+- `runId`, start time, terminal outcome (`completed`, `declined`, `skipped`, or `failed`);
 - model identity and parent context-token estimate;
 - sample rate and planner usage snapshot;
 - selected agent name and task character count only when the plan delegates;
@@ -143,7 +143,7 @@ A delegated workflow record includes the same usage fields plus the existing age
 
 - Missing usage, malformed cost data, or an unavailable context estimate never fails routing or execution.
 - A shadow timeout, provider error, discovery error, or index-read error is logged concisely and recorded as a shadow failure; the main prompt proceeds normally.
-- A shadow abort on shutdown or session switch is recorded as cancelled and cannot attach to a later session.
+- A shadow aborted by shutdown or a session lifecycle reset is invalidated and suppressed: it records nothing further and cannot attach to or write into a later session.
 - Measurement state-entry failures are caught and logged; they never replay a request or block a child.
 - The planner receives the same standalone inputs already used by delegation. No parent transcript or hidden context is copied into the shadow request.
 - Existing slash-command bypasses remain before routing, delegation, and shadow measurement.

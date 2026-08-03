@@ -129,7 +129,7 @@ The default agent list is `scout`, `sonic`, `task`, `designer`, `reviewer`, and 
 - **Pass-through:** when the planner declines, or no automatic route was applied, the original prompt is replayed once, in order, as a normal main-session follow-up. The replay is not planned again.
 - **Planner failure:** a planner timeout, unparseable plan, unavailable planned agent, or empty planned task also replays the original prompt once as a follow-up.
 - **Subagent failure:** a failed or crashed subagent renders a visible failure message, then replays the original prompt once with an appended warning that the failed attempt may have produced side effects.
-- **Cancellation:** `/route cancel`, or session shutdown, aborts the active workflow. A cancelled prompt is **not** replayed, and cancellation does not undo work already performed — a subagent aborted mid-run can leave partial side effects in the working directory.
+- **Cancellation:** `/route cancel`, or session shutdown, aborts the active workflow and records a `cancelled` entry in the same session. A cancelled prompt is **not** replayed, and cancellation does not undo work already performed — a subagent aborted mid-run can leave partial side effects in the working directory. Session start, switch, branch, and tree lifecycle events instead **invalidate** the active workflow: it is aborted and suppressed, so it records no further entry (not even `cancelled`), sends no result message, replays nothing, and cannot write into the successor session.
 
 Every workflow transition is recorded as a `model-router-delegation` state entry with a `pending`, `delegated`, `completed`, `failed`, `cancelled`, or `passed-through` status, carrying a `measurement` block with the parent context token count plus planner and child usage. [Shadow measurement](#shadow-measurement) appends `shadow` and `measured` entries to the same stream. Only one delegation workflow runs at a time; text submitted while one is active is handled by the main session as usual.
 
@@ -147,7 +147,7 @@ Every workflow transition is recorded as a `model-router-delegation` state entry
 - **Shadow isolation:** a sampled prompt triggers one detached planning call on the selected route model. The shadow planner never executes a child subagent and never forwards parent conversation context — like the real planner, it sees only the prompt text, the eligible agent list, and the bounded repository index. The main-session turn proceeds untouched.
 - **Usage fields:** planner, child, and parent usage snapshots each report input, output, cache-read, and cache-write tokens, the token total, and the provider-reported cost when the provider reports one; unreported values stay `null`. The main-path turn that follows a shadow run (or the replayed turn after a pass-through) is correlated afterwards as a `measured` entry carrying `parentUsage`.
 
-Measurement never affects routing, delegation, or replay: a failed or cancelled shadow run only logs a warning and records its outcome.
+Measurement never affects routing, delegation, or replay: a failed shadow run only logs a warning and records a metadata-only failure outcome, and a shadow aborted by a session lifecycle reset is suppressed entirely — it records nothing and cannot write into a successor session.
 
 ## Commands
 

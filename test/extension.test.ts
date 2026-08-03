@@ -1291,6 +1291,55 @@ describe("model router delegation", () => {
 		expect(harness.executeCalls).toEqual([]);
 	});
 
+	it("invalidates an in-flight planner workflow on session switch without successor entries or replay", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		const deferred = Promise.withResolvers<DelegationPlan>();
+		harness.planResults = [() => deferred.promise];
+		expect(await harness.input("the original standalone request")).toEqual({ handled: true });
+		await harness.settle(() => harness.planCalls.length === 1);
+
+		await harness.lifecycle("session_switch");
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: false, reason: "successor decline" }];
+		expect(await harness.input("a fresh standalone request")).toEqual({ handled: true });
+		deferred.resolve({ delegate: false, reason: "stale decline" });
+		await harness.settle(() => harness.userMessages.length === 1);
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+
+		expect(harness.userMessages).toEqual([{ content: "a fresh standalone request", deliverAs: "followUp" }]);
+		expect(harness.customMessages).toEqual([]);
+		expect(harness.delegationEntries().map(entry => [entry.status, entry.request])).toEqual([
+			["pending", "the original standalone request"],
+			["pending", "a fresh standalone request"],
+			["passed-through", "a fresh standalone request"],
+		]);
+
+		await harness.messageEnd(userEndMessage("the original standalone request"));
+		await harness.messageEnd(assistantEndMessage(parentAssistantUsage(8, 4, 0.5)));
+		await harness.agentEnd(false);
+		expect(harness.measuredEntries()).toEqual([]);
+	});
+
+	it("suppresses a stale child result after session switch: no entry, no message, no replay", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		const deferredResult = Promise.withResolvers<SingleResult>();
+		harness.executeResults = [() => deferredResult.promise];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.executeCalls.length === 1);
+		const entriesBefore = harness.delegationEntries().length;
+
+		await harness.lifecycle("session_switch");
+		deferredResult.resolve(singleResult({ exitCode: 1, error: "child exploded late", output: "" }));
+		for (let turn = 0; turn < 25; turn += 1) await Promise.resolve();
+
+		expect(harness.delegationEntries()).toHaveLength(entriesBefore);
+		expect(harness.customMessages).toEqual([]);
+		expect(harness.userMessages).toEqual([]);
+	});
+
 	it("reports no active workflow for /route cancel when idle", async () => {
 		const harness = await enabledHarness();
 		await harness.command("cancel");
@@ -1465,6 +1514,21 @@ describe("model router measurement", () => {
 			outcome: "decline",
 			runId: "model-router-shadow-2",
 		});
+	});
+
+	it("keeps raw planner excerpts out of persisted shadow failure metadata", async () => {
+		const harness = await sampledHarness(1, 0);
+		harness.classifications = ["low"];
+		harness.planResults = [
+			new Error(
+				'model-router: unparseable delegation plan: "LEAKED_PLANNER_EXCERPT refactor the payments module"',
+			),
+		];
+		await harness.input("please summarize the repository layout");
+		await harness.settle(() => harness.shadowEntries().length === 1);
+
+		expect(harness.shadowEntries()[0]).toMatchObject({ status: "shadow", outcome: "failed", reason: "Error" });
+		expect(JSON.stringify(harness.shadowEntries()[0])).not.toContain("LEAKED_PLANNER_EXCERPT");
 	});
 
 	it("captures planner and child usage snapshots in delegated records", async () => {
