@@ -1192,6 +1192,16 @@ describe("model router delegation", () => {
 		expect(harness.delegationEntries()).toEqual([]);
 	});
 
+	it("returns the status bar to delegation idle after a workflow settles so cancel matches reality", async () => {
+		const harness = await successfulDelegation();
+		await harness.settle(() => harness.statuses.at(-1)?.includes("(idle)") === true);
+		expect(harness.statuses.at(-1)).toContain("delegation on (idle)");
+
+		await harness.command("cancel");
+		expect(harness.notifications.at(-1)?.message).toContain("no active delegation");
+		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "completed" });
+	});
+
 	it("reports delegation and workflow state in /route status", async () => {
 		const disabled = new Harness();
 		disabled.config = routerConfig();

@@ -614,8 +614,11 @@ export function createModelRouterExtension(
 			return run;
 		};
 
-		const releaseDelegation = (runId: string): void => {
-			if (activeDelegation?.runId === runId) activeDelegation = undefined;
+		const releaseDelegation = (runId: string, ctx: ExtensionContext): void => {
+			if (activeDelegation?.runId !== runId) return;
+			activeDelegation = undefined;
+			// The workflow just went active -> idle; without a refresh the bar keeps saying "active".
+			if (state) ctx.ui.setStatus(STATUS_KEY, routerStatus(state));
 		};
 
 		/** Synchronous gate; MUST NOT await so eligible input is claimed before any provider call. */
@@ -647,7 +650,7 @@ export function createModelRouterExtension(
 			};
 			const replayOriginal = (status: DelegationEntryStatus, reason: string): void => {
 				record(status, { reason });
-				releaseDelegation(runId);
+				releaseDelegation(runId, ctx);
 				pi.sendUserMessage(workflow.request, { deliverAs: "followUp" });
 			};
 			let delegated: { agent: AgentDefinition; task: string; model: string } | undefined;
@@ -664,7 +667,7 @@ export function createModelRouterExtension(
 					},
 					{ triggerTurn: false },
 				);
-				releaseDelegation(runId);
+				releaseDelegation(runId, ctx);
 				pi.sendUserMessage(
 					`${workflow.request}\n\nWarning: a delegated subagent attempt failed and may have produced side effects; inspect the current state before repeating work.`,
 					{ deliverAs: "followUp" },
@@ -752,7 +755,7 @@ export function createModelRouterExtension(
 				if (delegated) return childFailure(reason);
 				return replayOriginal("failed", reason);
 			} finally {
-				releaseDelegation(runId);
+				releaseDelegation(runId, ctx);
 			}
 		};
 
@@ -775,7 +778,7 @@ export function createModelRouterExtension(
 			});
 			void processDelegation(event, ctx, workflow).catch((error: unknown) => {
 				pi.logger.warn(`model-router: delegation workflow ${workflow.runId} crashed: ${conciseReason(error)}`);
-				releaseDelegation(workflow.runId);
+				releaseDelegation(workflow.runId, ctx);
 			});
 			return { handled: true };
 		};
