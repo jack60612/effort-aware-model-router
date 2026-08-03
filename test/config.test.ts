@@ -48,12 +48,14 @@ describe("loadRouterConfig", () => {
 				enabled: false,
 				plannerTimeoutMs: 20_000,
 				agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+				measurement: { enabled: false, sampleRate: 0.1 },
 			},
 		});
 		expect(config).not.toBe(DEFAULT_ROUTER_CONFIG);
 		expect(config.thresholds).not.toBe(DEFAULT_ROUTER_CONFIG.thresholds);
 		expect(config.delegation).not.toBe(DEFAULT_ROUTER_CONFIG.delegation);
 		expect(config.delegation.agents).not.toBe(DEFAULT_ROUTER_CONFIG.delegation.agents);
+		expect(config.delegation.measurement).not.toBe(DEFAULT_ROUTER_CONFIG.delegation.measurement);
 	});
 
 	it("layers user, project, and explicit config in that order", async () => {
@@ -100,6 +102,7 @@ describe("loadRouterConfig", () => {
 				enabled: false,
 				plannerTimeoutMs: 20_000,
 				agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+				measurement: { enabled: false, sampleRate: 0.1 },
 			},
 		});
 	});
@@ -146,7 +149,43 @@ describe("loadRouterConfig", () => {
 			enabled: true,
 			plannerTimeoutMs: 30_000,
 			agents: ["scout"],
+			measurement: { enabled: false, sampleRate: 0.1 },
 		});
+	});
+	it("layers measurement fields independently across project and explicit config", async () => {
+		await writeJson(path.join(cwd, ".omp", "model-router.json"), {
+			delegation: { measurement: { enabled: true } },
+		});
+		const explicitFile = path.join(root, "explicit-measurement.json");
+		await writeJson(explicitFile, {
+			delegation: { measurement: { sampleRate: 0.75 } },
+		});
+
+		const config = await loadRouterConfig({
+			cwd,
+			homeDir,
+			env: { OMP_MODEL_ROUTER_CONFIG: explicitFile },
+		});
+
+		expect(config.delegation).toEqual({
+			enabled: false,
+			plannerTimeoutMs: 20_000,
+			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+			measurement: { enabled: true, sampleRate: 0.75 },
+		});
+	});
+
+	it("ignores invalid nested measurement values without erasing earlier valid values", async () => {
+		await writeJson(path.join(homeDir, ".omp", "agent", "model-router.json"), {
+			delegation: { measurement: { enabled: true, sampleRate: 0.6 } },
+		});
+		await writeJson(path.join(cwd, ".omp", "model-router.json"), {
+			delegation: { measurement: { enabled: "yes", sampleRate: 2 } },
+		});
+
+		const config = await loadRouterConfig({ cwd, homeDir, env: {} });
+
+		expect(config.delegation.measurement).toEqual({ enabled: true, sampleRate: 0.6 });
 	});
 
 	it("ignores missing, malformed, and non-object config files", async () => {
@@ -280,6 +319,7 @@ describe("parseRouterConfigLayer", () => {
 			enabled: false,
 			plannerTimeoutMs: 20_000,
 			agents: ["scout", "sonic", "task", "designer", "reviewer", "security-reviewer"],
+			measurement: { enabled: false, sampleRate: 0.1 },
 		});
 		expect(DEFAULT_DELEGATION_AGENTS).toEqual([
 			"scout",
@@ -296,6 +336,28 @@ describe("parseRouterConfigLayer", () => {
 			}),
 		).toEqual({
 			delegation: { enabled: true, plannerTimeoutMs: 45_000, agents: ["scout", "task"] },
+		});
+	});
+	it("parses only valid own nested measurement fields", () => {
+		const inheritedMeasurement = { enabled: true, sampleRate: 0.9 };
+		const measurement = Object.create(inheritedMeasurement) as Record<string, unknown>;
+		measurement.enabled = false;
+		measurement.sampleRate = 0.25;
+
+		expect(parseRouterConfigLayer({ delegation: { measurement } })).toEqual({
+			delegation: { measurement: { enabled: false, sampleRate: 0.25 } },
+		});
+
+		for (const sampleRate of [-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(parseRouterConfigLayer({ delegation: { measurement: { sampleRate } } })).toEqual({
+				delegation: { measurement: {} },
+			});
+		}
+		expect(parseRouterConfigLayer({ delegation: { measurement: { enabled: "yes", sampleRate: 0 } } })).toEqual({
+			delegation: { measurement: { sampleRate: 0 } },
+		});
+		expect(parseRouterConfigLayer({ delegation: { measurement: { enabled: true, sampleRate: 1 } } })).toEqual({
+			delegation: { measurement: { enabled: true, sampleRate: 1 } },
 		});
 	});
 

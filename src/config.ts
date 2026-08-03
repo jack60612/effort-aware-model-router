@@ -20,11 +20,21 @@ export const DEFAULT_DELEGATION_AGENTS = [
 	"security-reviewer",
 ] as const;
 
+export interface RouterDelegationMeasurementConfig {
+	enabled: boolean;
+	sampleRate: number;
+}
+
 export interface RouterDelegationConfig {
 	enabled: boolean;
 	plannerTimeoutMs: number;
 	agents: readonly string[];
+	measurement: RouterDelegationMeasurementConfig;
 }
+
+export type RouterDelegationConfigLayer = Partial<Omit<RouterDelegationConfig, "measurement">> & {
+	measurement?: Partial<RouterDelegationMeasurementConfig>;
+};
 
 export const MAX_DELEGATION_PLANNER_TIMEOUT_MS = 120_000;
 
@@ -43,7 +53,7 @@ export interface RouterConfig {
 export type RouterConfigLayer = Partial<Omit<RouterConfig, "thresholds" | "thinkingProfiles" | "delegation">> & {
 	thresholds?: Partial<Record<RouteEffort, RouterThresholdInput>>;
 	thinkingProfiles?: RouterThinkingProfiles;
-	delegation?: Partial<RouterDelegationConfig>;
+	delegation?: RouterDelegationConfigLayer;
 };
 
 export interface LoadRouterConfigOptions {
@@ -51,6 +61,11 @@ export interface LoadRouterConfigOptions {
 	homeDir?: string;
 	env?: Readonly<Record<string, string | undefined>>;
 }
+
+const DEFAULT_DELEGATION_MEASUREMENT: Readonly<RouterDelegationMeasurementConfig> = Object.freeze({
+	enabled: false,
+	sampleRate: 0.1,
+});
 
 export const DEFAULT_ROUTER_CONFIG: Readonly<RouterConfig> = Object.freeze({
 	enabled: true,
@@ -68,6 +83,7 @@ export const DEFAULT_ROUTER_CONFIG: Readonly<RouterConfig> = Object.freeze({
 		enabled: false,
 		plannerTimeoutMs: 20_000,
 		agents: Object.freeze([...DEFAULT_DELEGATION_AGENTS]),
+		measurement: DEFAULT_DELEGATION_MEASUREMENT,
 	}),
 });
 
@@ -201,7 +217,7 @@ export function parseRouterConfigLayer(value: unknown): RouterConfigLayer {
 		!Array.isArray(input.delegation)
 	) {
 		const inputDelegation = input.delegation as Record<string, unknown>;
-		const delegation: Partial<RouterDelegationConfig> = {};
+		const delegation: RouterDelegationConfigLayer = {};
 		if (hasOwn(inputDelegation, "enabled") && typeof inputDelegation.enabled === "boolean") {
 			delegation.enabled = inputDelegation.enabled;
 		}
@@ -217,6 +233,28 @@ export function parseRouterConfigLayer(value: unknown): RouterConfigLayer {
 		if (hasOwn(inputDelegation, "agents") && Array.isArray(inputDelegation.agents)) {
 			const agents = cleanSelectors(inputDelegation.agents);
 			if (agents !== undefined) delegation.agents = agents;
+		}
+		if (
+			hasOwn(inputDelegation, "measurement") &&
+			typeof inputDelegation.measurement === "object" &&
+			inputDelegation.measurement !== null &&
+			!Array.isArray(inputDelegation.measurement)
+		) {
+			const inputMeasurement = inputDelegation.measurement as Record<string, unknown>;
+			const measurement: Partial<RouterDelegationMeasurementConfig> = {};
+			if (hasOwn(inputMeasurement, "enabled") && typeof inputMeasurement.enabled === "boolean") {
+				measurement.enabled = inputMeasurement.enabled;
+			}
+			if (
+				hasOwn(inputMeasurement, "sampleRate") &&
+				typeof inputMeasurement.sampleRate === "number" &&
+				Number.isFinite(inputMeasurement.sampleRate) &&
+				inputMeasurement.sampleRate >= 0 &&
+				inputMeasurement.sampleRate <= 1
+			) {
+				measurement.sampleRate = inputMeasurement.sampleRate;
+			}
+			delegation.measurement = measurement;
 		}
 		layer.delegation = delegation;
 	}
@@ -265,6 +303,10 @@ function mergeConfig(base: RouterConfig, layer: RouterConfigLayer): RouterConfig
 			enabled: layer.delegation?.enabled ?? base.delegation.enabled,
 			plannerTimeoutMs: layer.delegation?.plannerTimeoutMs ?? base.delegation.plannerTimeoutMs,
 			agents: [...(layer.delegation?.agents ?? base.delegation.agents)],
+			measurement: {
+				enabled: layer.delegation?.measurement?.enabled ?? base.delegation.measurement.enabled,
+				sampleRate: layer.delegation?.measurement?.sampleRate ?? base.delegation.measurement.sampleRate,
+			},
 		},
 	};
 }
@@ -298,6 +340,10 @@ export async function loadRouterConfig(options: LoadRouterConfigOptions = {}): P
 			enabled: DEFAULT_ROUTER_CONFIG.delegation.enabled,
 			plannerTimeoutMs: DEFAULT_ROUTER_CONFIG.delegation.plannerTimeoutMs,
 			agents: [...DEFAULT_ROUTER_CONFIG.delegation.agents],
+			measurement: {
+				enabled: DEFAULT_ROUTER_CONFIG.delegation.measurement.enabled,
+				sampleRate: DEFAULT_ROUTER_CONFIG.delegation.measurement.sampleRate,
+			},
 		},
 	};
 	for (const file of files) {
