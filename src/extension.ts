@@ -7,12 +7,17 @@ import type {
 	InputEvent,
 	InputEventResult,
 	SessionBranchEvent,
+	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
 } from "@oh-my-pi/pi-coding-agent";
+import { type AgentDefinition, discoverAgents } from "@oh-my-pi/pi-coding-agent/task";
+import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { Text } from "@oh-my-pi/pi-tui";
 import { classifyPromptEffort } from "./classifier";
 import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, type RouteEffort, type RouterConfig } from "./config";
+import { type DelegationPlan, loadRepositoryAgentIndex, planDelegation } from "./delegation";
 import {
 	clampEffortToModel,
 	estimatePromptTokens,
@@ -40,8 +45,12 @@ import {
 } from "./state";
 
 const STATUS_KEY = "model-router";
+/** State-only session entries recording each delegation workflow transition. */
+export const MODEL_ROUTER_DELEGATION_ENTRY = "model-router-delegation";
+/** Visible custom message carrying a delegated request/result exchange. */
+export const MODEL_ROUTER_DELEGATION_MESSAGE = "model-router-delegation-result";
 const COMMAND_USAGE =
-	"Usage: /route auto | manual [selector] | off | status | explain | history | once <selector> | setup | reload";
+	"Usage: /route auto | manual [selector] | off | status | explain | history | once <selector> | cancel | setup | reload";
 
 const ROUTE_COMMAND_COMPLETIONS = [
 	{ label: "auto", value: "auto", description: "Enable automatic effort-aware routing" },
@@ -51,6 +60,7 @@ const ROUTE_COMMAND_COMPLETIONS = [
 	{ label: "explain", value: "explain", description: "Show the latest routing decision details" },
 	{ label: "history", value: "history", description: "Show recent routing decisions" },
 	{ label: "once", value: "once", description: "Route the next prompt to a model selector" },
+	{ label: "cancel", value: "cancel", description: "Cancel the active delegation workflow" },
 	{ label: "setup", value: "setup", description: "Configure routing interactively" },
 	{ label: "reload", value: "reload", description: "Reload routing configuration from disk" },
 ];
@@ -100,6 +110,27 @@ export interface ModelRouterExtensionDependencies {
 	classify: Classify;
 	now?: () => number;
 	setup?: typeof runRouterSetup;
+	plan?: typeof planDelegation;
+	discover?: typeof discoverAgents;
+	execute?: typeof runSubprocess;
+	loadAgentIndex?: typeof loadRepositoryAgentIndex;
+}
+
+/** Successfully applied route: the model now active for the prompt plus its applied efforts. */
+export interface RoutedPrompt {
+	model: Model;
+	effort?: RouteEffort;
+	thinking?: ExtensionThinkingLevel;
+}
+
+type DelegationEntryStatus = "pending" | "delegated" | "completed" | "failed" | "cancelled" | "passed-through";
+
+interface DelegationWorkflow {
+	runId: string;
+	index: number;
+	controller: AbortController;
+	request: string;
+	startedAt: number;
 }
 
 function identityOf(model: Pick<Model, "provider" | "id"> | undefined): ModelIdentity | null {
@@ -192,6 +223,12 @@ function defaultConfig(): RouterConfig {
 	};
 }
 
+/** Bound failure diagnostics so raw planner/child payloads never flood logs, entries, or the UI. */
+function conciseReason(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.length > 200 ? `${message.slice(0, 200)}…` : message;
+}
+
 /** Build an extension factory with narrow seams for direct behavior tests. */
 export function createModelRouterExtension(
 	dependencies: Partial<ModelRouterExtensionDependencies> = {},
@@ -200,10 +237,16 @@ export function createModelRouterExtension(
 	const classify = dependencies.classify ?? classifyPromptEffort;
 	const now = dependencies.now ?? Date.now;
 	const setup = dependencies.setup ?? runRouterSetup;
+	const planWorkflow = dependencies.plan ?? planDelegation;
+	const discover = dependencies.discover ?? discoverAgents;
+	const execute = dependencies.execute ?? runSubprocess;
+	const loadAgentIndex = dependencies.loadAgentIndex ?? loadRepositoryAgentIndex;
 
 	return (pi: ExtensionAPI): void => {
 		let config = defaultConfig();
 		let state: RouterState | undefined;
+		let activeDelegation: DelegationWorkflow | undefined;
+		let delegationRunSequence = 0;
 
 		const persist = (ctx: ExtensionContext): void => {
 			if (!state) return;
@@ -395,7 +438,7 @@ export function createModelRouterExtension(
 			persist(ctx);
 		};
 
-		const routePrompt = async (event: InputEvent, ctx: ExtensionContext): Promise<void> => {
+		const routePrompt = async (event: InputEvent, ctx: ExtensionContext): Promise<RoutedPrompt | undefined> => {
 			const runtime = ensureState(ctx);
 			const oneShotSelector = runtime.oneShotSelector;
 			if (oneShotSelector === undefined && runtime.mode !== "auto") return;
@@ -540,6 +583,177 @@ export function createModelRouterExtension(
 			});
 			if (oneShotSelector !== undefined) consumeOneShotSelector(runtime);
 			persist(ctx);
+			return {
+				model: target,
+				effort,
+				thinking: thinking ? THINKING_LEVEL_BY_EFFORT[thinking] : undefined,
+			};
+		};
+
+		const delegationStatus = (): string =>
+			`delegation ${config.delegation.enabled ? "on" : "off"} (${activeDelegation ? "active" : "idle"})`;
+
+		const releaseDelegation = (runId: string): void => {
+			if (activeDelegation?.runId === runId) activeDelegation = undefined;
+		};
+
+		/** Synchronous gate; MUST NOT await so eligible input is claimed before any provider call. */
+		const delegationEligible = (event: InputEvent, runtime: RouterState): boolean =>
+			config.delegation.enabled &&
+			runtime.mode === "auto" &&
+			runtime.oneShotSelector === undefined &&
+			activeDelegation === undefined &&
+			(event.images === undefined || event.images.length === 0) &&
+			event.text.trim().length >= config.classifierMinPromptChars;
+
+		const processDelegation = async (
+			event: InputEvent,
+			ctx: ExtensionContext,
+			workflow: DelegationWorkflow,
+		): Promise<void> => {
+			const { runId, controller } = workflow;
+			const record = (status: DelegationEntryStatus, detail: Record<string, unknown> = {}): void => {
+				pi.appendEntry(MODEL_ROUTER_DELEGATION_ENTRY, {
+					status,
+					runId,
+					request: workflow.request,
+					startedAt: workflow.startedAt,
+					...detail,
+				});
+			};
+			const cancelled = (detail: Record<string, unknown> = {}): void => {
+				record("cancelled", { reason: String(controller.signal.reason ?? "cancelled"), ...detail });
+			};
+			const replayOriginal = (status: DelegationEntryStatus, reason: string): void => {
+				record(status, { reason });
+				releaseDelegation(runId);
+				pi.sendUserMessage(workflow.request, { deliverAs: "followUp" });
+			};
+			let delegated: { agent: AgentDefinition; task: string; model: string } | undefined;
+			const childFailure = (rawReason: string): void => {
+				if (!delegated) return;
+				const reason = conciseReason(rawReason);
+				record("failed", { agent: delegated.agent.name, task: delegated.task, model: delegated.model, reason });
+				pi.sendMessage(
+					{
+						customType: MODEL_ROUTER_DELEGATION_MESSAGE,
+						content: `Delegation to ${delegated.agent.name} failed: ${reason}\n\nRequest: ${workflow.request}`,
+						display: true,
+						details: { runId, agent: delegated.agent.name, task: delegated.task, model: delegated.model },
+					},
+					{ triggerTurn: false },
+				);
+				releaseDelegation(runId);
+				pi.sendUserMessage(
+					`${workflow.request}\n\nWarning: a delegated subagent attempt failed and may have produced side effects; inspect the current state before repeating work.`,
+					{ deliverAs: "followUp" },
+				);
+			};
+			try {
+				const routed = await routePrompt(event, ctx);
+				if (controller.signal.aborted) return cancelled();
+				if (!routed) return replayOriginal("passed-through", "no automatic route was applied");
+				const selector = formatModelSelector(routed.model);
+				const discovery = await discover(ctx.cwd);
+				if (controller.signal.aborted) return cancelled();
+				const allowed = new Set(config.delegation.agents);
+				const eligibleAgents = discovery.agents.filter(agent => allowed.has(agent.name));
+				const repositoryIndex = await loadAgentIndex(ctx.cwd);
+				if (controller.signal.aborted) return cancelled();
+				const plan: DelegationPlan = await planWorkflow(
+					workflow.request,
+					routed.model,
+					eligibleAgents.map(agent => ({ name: agent.name, description: agent.description })),
+					repositoryIndex,
+					config.delegation,
+					{
+						modelRegistry: ctx.modelRegistry,
+						sessionId: ctx.sessionManager.getSessionId(),
+						signal: controller.signal,
+					},
+				);
+				if (controller.signal.aborted) return cancelled();
+				if (!plan.delegate) return replayOriginal("passed-through", plan.reason);
+				const definition = eligibleAgents.find(agent => agent.name === plan.agent);
+				if (!definition) return replayOriginal("failed", `planned agent ${plan.agent} is not available`);
+				if (plan.task.trim().length === 0) return replayOriginal("failed", "planned task is empty");
+				delegated = { agent: definition, task: plan.task, model: selector };
+				record("delegated", {
+					agent: definition.name,
+					task: plan.task,
+					model: selector,
+					effort: routed.effort,
+				});
+				const result = await execute({
+					cwd: ctx.cwd,
+					agent: definition,
+					task: plan.task,
+					index: workflow.index,
+					id: runId,
+					modelOverride: selector,
+					thinkingLevel: routed.thinking,
+					signal: controller.signal,
+					keepAlive: false,
+				});
+				if (controller.signal.aborted || result.aborted) return cancelled({ agent: definition.name });
+				if (result.exitCode !== 0 || result.error) {
+					return childFailure(result.error ?? `subagent exited with code ${result.exitCode}`);
+				}
+				record("completed", {
+					agent: definition.name,
+					task: plan.task,
+					model: selector,
+					effort: routed.effort,
+				});
+				pi.sendMessage(
+					{
+						customType: MODEL_ROUTER_DELEGATION_MESSAGE,
+						content: `Delegated to ${definition.name}: ${workflow.request}\n\n${result.output}`,
+						display: true,
+						details: {
+							runId,
+							agent: definition.name,
+							task: plan.task,
+							model: selector,
+							exitCode: result.exitCode,
+							durationMs: result.durationMs,
+						},
+					},
+					{ triggerTurn: false },
+				);
+			} catch (error) {
+				if (controller.signal.aborted) return cancelled();
+				const reason = conciseReason(error);
+				pi.logger.warn(`model-router: delegation workflow ${runId} failed: ${reason}`);
+				if (delegated) return childFailure(reason);
+				return replayOriginal("failed", reason);
+			} finally {
+				releaseDelegation(runId);
+			}
+		};
+
+		/** Claim one workflow synchronously and start the async pipeline detached. */
+		const claimDelegation = (event: InputEvent, ctx: ExtensionContext): InputEventResult => {
+			delegationRunSequence += 1;
+			const workflow: DelegationWorkflow = {
+				runId: `model-router-delegation-${delegationRunSequence}`,
+				index: delegationRunSequence,
+				controller: new AbortController(),
+				request: event.text,
+				startedAt: now(),
+			};
+			activeDelegation = workflow;
+			pi.appendEntry(MODEL_ROUTER_DELEGATION_ENTRY, {
+				status: "pending",
+				runId: workflow.runId,
+				request: workflow.request,
+				startedAt: workflow.startedAt,
+			});
+			void processDelegation(event, ctx, workflow).catch((error: unknown) => {
+				pi.logger.warn(`model-router: delegation workflow ${workflow.runId} crashed: ${conciseReason(error)}`);
+				releaseDelegation(workflow.runId);
+			});
+			return { handled: true };
 		};
 
 		pi.registerCommand("route", {
@@ -562,8 +776,20 @@ export function createModelRouterExtension(
 				}
 				if (command === "status" && parts.length === 1) {
 					const runtime = ensureState(ctx);
-					ctx.ui.setStatus(STATUS_KEY, routeStatus(runtime));
-					ctx.ui.notify(routeStatus(runtime), "info");
+					const status = `${routeStatus(runtime)} · ${delegationStatus()}`;
+					ctx.ui.setStatus(STATUS_KEY, status);
+					ctx.ui.notify(status, "info");
+					return;
+				}
+				if (command === "cancel" && parts.length === 1) {
+					if (!activeDelegation) {
+						ctx.ui.notify("Model router has no active delegation workflow", "info");
+						return;
+					}
+					activeDelegation.controller.abort(
+						new Error("model-router: delegation cancelled by /route cancel"),
+					);
+					ctx.ui.notify("Model router delegation workflow cancelled", "info");
 					return;
 				}
 				if (command === "explain" && parts.length === 1) {
@@ -644,6 +870,20 @@ export function createModelRouterExtension(
 		pi.on("session_switch", handleSessionSwitch);
 		pi.on("session_branch", handleSessionLifecycle);
 		pi.on("session_tree", handleSessionLifecycle);
+		pi.on("session_shutdown", async (_event: SessionShutdownEvent): Promise<void> => {
+			activeDelegation?.controller.abort(new Error("model-router: delegation cancelled by session shutdown"));
+		});
+
+		pi.registerMessageRenderer(MODEL_ROUTER_DELEGATION_MESSAGE, message => {
+			const content =
+				typeof message.content === "string"
+					? message.content
+					: message.content
+							.filter((part): part is Extract<(typeof message.content)[number], { type: "text" }> => part.type === "text")
+							.map(part => part.text)
+							.join("\n");
+			return new Text(content);
+		});
 
 		pi.on("input", async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult | void> => {
 			if (!isMainIdleInput(event, ctx)) return;
@@ -653,6 +893,7 @@ export function createModelRouterExtension(
 			}
 			const text = event.text.trim();
 			if (text.length === 0 || text.startsWith("/") || text.startsWith("->") || text.startsWith("=>")) return;
+			if (delegationEligible(event, ensureState(ctx))) return claimDelegation(event, ctx);
 			await routePrompt(event, ctx);
 		});
 	};
