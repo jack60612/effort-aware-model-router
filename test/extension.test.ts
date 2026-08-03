@@ -1520,9 +1520,7 @@ describe("model router measurement", () => {
 		const harness = await sampledHarness(1, 0);
 		harness.classifications = ["low"];
 		harness.planResults = [
-			new Error(
-				'model-router: unparseable delegation plan: "LEAKED_PLANNER_EXCERPT refactor the payments module"',
-			),
+			new Error('model-router: unparseable delegation plan: "LEAKED_PLANNER_EXCERPT refactor the payments module"'),
 		];
 		await harness.input("please summarize the repository layout");
 		await harness.settle(() => harness.shadowEntries().length === 1);
