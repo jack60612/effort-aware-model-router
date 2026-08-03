@@ -30,7 +30,7 @@ function response(text: string, overrides: Partial<AssistantMessage> = {}): Assi
 		api: "openai-responses",
 		provider: "mock-provider",
 		model: "planner",
-		usage: {},
+		usage: undefined,
 		stopReason: "stop",
 		timestamp: 123,
 		...overrides,
@@ -356,7 +356,7 @@ describe("planDelegation", () => {
 				now: () => 1,
 				timeoutSignal: () => new AbortController().signal,
 			}),
-		).resolves.toEqual({ delegate: false, reason: "needs prior context", usage: {} });
+		).resolves.toEqual({ delegate: false, reason: "needs prior context", usage: undefined });
 	});
 
 	it("throws on missing credentials without calling complete", async () => {

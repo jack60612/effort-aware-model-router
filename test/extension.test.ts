@@ -1429,9 +1429,7 @@ describe("model router measurement", () => {
 		await harness.settle(() => harness.planCalls.length === 1);
 
 		await harness.input("the second sampled standalone prompt");
-		await harness.settle(() =>
-			harness.shadowEntries().some(entry => entry.outcome === "skipped"),
-		);
+		await harness.settle(() => harness.shadowEntries().some(entry => entry.outcome === "skipped"));
 		expect(harness.planCalls).toHaveLength(1);
 		expect(harness.shadowEntries().at(-1)).toMatchObject({
 			status: "shadow",

@@ -1103,9 +1103,7 @@ export function createModelRouterExtension(
 				for (const record of pendingParentMeasurements) {
 					if (record.phase !== "awaiting-user") continue;
 					const matched =
-						record.match === "exact"
-							? text === record.expectedPrefix
-							: text.startsWith(record.expectedPrefix);
+						record.match === "exact" ? text === record.expectedPrefix : text.startsWith(record.expectedPrefix);
 					if (matched) {
 						record.phase = "collecting-assistant";
 						break;
