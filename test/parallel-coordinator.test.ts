@@ -186,6 +186,8 @@ interface HarnessOptions {
 	commitToBranch?: ParallelCoordinatorDependencies["commitToBranch"];
 	mergeTaskBranches?: ParallelCoordinatorDependencies["mergeTaskBranches"];
 	currentModelSelector?: string;
+	/** Use the coordinator's built-in review worktree seam instead of the fake. */
+	defaultReviewWorktree?: boolean;
 }
 
 function okResult(output: string): ParallelSubagentResult {
@@ -195,6 +197,7 @@ function okResult(output: string): ParallelSubagentResult {
 function makeHarness(options: HarnessOptions = {}) {
 	const events: string[] = [];
 	const requests: ParallelSubagentRequest[] = [];
+	const execCalls: Array<{ command: string; args: string[] }> = [];
 	const store = new FakeStore();
 	let runCounter = 0;
 	let active = 0;
@@ -210,7 +213,10 @@ function makeHarness(options: HarnessOptions = {}) {
 	const host: ParallelCoordinatorHost = {
 		cwd: REPO_ROOT,
 		...(options.currentModelSelector === undefined ? {} : { currentModelSelector: options.currentModelSelector }),
-		exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+		exec: async (command, args) => {
+			execCalls.push({ command, args: [...args] });
+			return { stdout: "", stderr: "", exitCode: 0 };
+		},
 		discover: async () => ({ agents }),
 		runSubagent: async request => {
 			requests.push(request);
@@ -260,17 +266,21 @@ function makeHarness(options: HarnessOptions = {}) {
 		cleanupTaskBranches: async (_repoRoot, branches) => {
 			events.push(`prune:${branches.join(",")}`);
 		},
-		createReviewWorktree: async (_repoRoot, branchName, worktreeId) => {
-			events.push(`review-wt:${branchName}:${worktreeId}`);
-			return `/review/${worktreeId}`;
-		},
-		removeReviewWorktree: async (_repoRoot, worktreeDir) => {
-			events.push(`review-rm:${worktreeDir}`);
-		},
+		...(options.defaultReviewWorktree === true
+			? {}
+			: {
+					createReviewWorktree: async (_repoRoot: string, branchName: string, worktreeId: string) => {
+						events.push(`review-wt:${branchName}:${worktreeId}`);
+						return `/review/${worktreeId}`;
+					},
+					removeReviewWorktree: async (_repoRoot: string, worktreeDir: string) => {
+						events.push(`review-rm:${worktreeDir}`);
+					},
+				}),
 	};
 
 	const coordinator = new ParallelCoordinator(host, dependencies);
-	return { coordinator, store, events, requests, maxActive: () => maxActive };
+	return { coordinator, store, events, requests, execCalls, maxActive: () => maxActive };
 }
 
 const REVIEW_OK = JSON.stringify({ approved: true, summary: "looks good", findings: [] });
@@ -468,6 +478,53 @@ describe("parallel coordinator reviews", () => {
 		expect(harness.events).toContain("review-rm:/review/run-1-a-review");
 	});
 
+	it("the default review worktree seam uses a unique directory per attempt", async () => {
+		let verdict = "not json";
+		const harness = makeHarness({
+			defaultReviewWorktree: true,
+			runSubagent: async request => (request.id.endsWith("-review") ? okResult(verdict) : okResult("did work")),
+		});
+		const plan = makePlan([{ id: "a", review: { agent: "reviewer", required: true } }]);
+		const created = await harness.coordinator.createRun(plan);
+		const first = await harness.coordinator.resume(created.run.runId);
+		expect(first.reviews[0]?.status).toBe("failed");
+
+		verdict = REVIEW_OK;
+		const retried = await harness.coordinator.review(created.run.runId);
+		expect(retried.reviews[0]?.status).toBe("approved");
+
+		// Both attempts ran `git worktree add` against distinct directories, so
+		// a leftover registration from attempt one cannot block attempt two.
+		const adds = harness.execCalls.filter(
+			call => call.command === "git" && call.args.includes("worktree") && call.args.includes("add"),
+		);
+		expect(adds).toHaveLength(2);
+		const dirs = adds.map(call => call.args[5] ?? "");
+		expect(dirs[0]).not.toBe(dirs[1]);
+		for (const dir of dirs) expect(dir).toContain("omp-parallel-review-run-1-a-review-");
+		// Best-effort removal targeted each attempt's own directory.
+		const removes = harness.execCalls.filter(call => call.command === "git" && call.args.includes("remove"));
+		expect(removes.map(call => call.args[5])).toEqual(dirs);
+	});
+
+	it("a required review on a no-op shard is auto-approved and the run integrates", async () => {
+		const harness = makeHarness({ commitToBranch: async () => null });
+		const plan = makePlan([{ id: "a", review: { agent: "reviewer", required: true } }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.resume(created.run.runId);
+
+		expect(snapshot.shards[0]?.status).toBe("completed");
+		expect(snapshot.shards[0]?.branchName).toBeNull();
+		expect(snapshot.reviews[0]?.status).toBe("approved");
+		expect(snapshot.reviews[0]?.summary).toBe("No changes produced; review skipped.");
+		expect(snapshot.run.status).toBe("ready_to_integrate");
+		// The review subagent was never dispatched for the no-op shard.
+		expect(harness.requests.some(request => request.id.endsWith("-review"))).toBe(false);
+
+		const integrated = await harness.coordinator.integrate(created.run.runId);
+		expect(integrated.run.status).toBe("integrated");
+	});
+
 	it("parseParallelReviewVerdict enforces the strict bounded shape", () => {
 		expect(parseParallelReviewVerdict(REVIEW_OK)).toEqual({ approved: true, summary: "looks good", findings: [] });
 		expect(parseParallelReviewVerdict(`prose before {"approved":false,"summary":"s","findings":[]} after`)).toEqual({
@@ -546,13 +603,22 @@ describe("parallel coordinator integration", () => {
 		expect(harness.events).toContain("prune:task/run-1-a,task/run-1-b");
 	});
 
-	it("a merge conflict fails the run, preserves branch names, and prunes only merged branches", async () => {
+	it("a merge conflict prunes and clears only merged branches, and a retry integrates the rest", async () => {
+		let attempt = 0;
+		const mergeCalls: string[][] = [];
 		const harness = makeHarness({
-			mergeTaskBranches: async (_repoRoot, branches) => ({
-				merged: [branches[0]?.branchName ?? ""],
-				failed: [branches[1]?.branchName ?? ""],
-				conflict: "conflict cherry-picking task/run-1-b",
-			}),
+			mergeTaskBranches: async (_repoRoot, branches) => {
+				attempt += 1;
+				mergeCalls.push(branches.map(branch => branch.branchName));
+				if (attempt === 1) {
+					return {
+						merged: [branches[0]?.branchName ?? ""],
+						failed: [branches[1]?.branchName ?? ""],
+						conflict: "conflict cherry-picking task/run-1-b",
+					};
+				}
+				return { merged: branches.map(branch => branch.branchName), failed: [] };
+			},
 		});
 		const plan = makePlan([{ id: "a" }, { id: "b" }]);
 		const created = await harness.coordinator.createRun(plan);
@@ -561,10 +627,22 @@ describe("parallel coordinator integration", () => {
 
 		expect(snapshot.run.status).toBe("failed");
 		expect(snapshot.run.lastError).toBe("conflict cherry-picking task/run-1-b");
-		// Branch artifacts survive the conflict for manual recovery.
-		expect(snapshot.shards.map(shard => shard.branchName)).toEqual(["task/run-1-a", "task/run-1-b"]);
+		// The merged branch is pruned and cleared; the failed branch survives for retry.
+		expect(snapshot.shards.map(shard => shard.branchName)).toEqual([null, "task/run-1-b"]);
 		expect(harness.events).toContain("prune:task/run-1-a");
 		expect(harness.events.some(event => event.includes("task/run-1-b") && event.startsWith("prune:"))).toBe(false);
+
+		// resume() leaves the integration-failed run untouched for explicit retry.
+		const resumed = await harness.coordinator.resume(created.run.runId);
+		expect(resumed.run.status).toBe("failed");
+		expect(resumed.run.lastError).toBe("conflict cherry-picking task/run-1-b");
+
+		// The retry submits only the unmerged branch; the pruned one is never re-merged.
+		const retried = await harness.coordinator.integrate(created.run.runId);
+		expect(retried.run.status).toBe("integrated");
+		expect(retried.run.lastError).toBeNull();
+		expect(mergeCalls).toEqual([["task/run-1-a", "task/run-1-b"], ["task/run-1-b"]]);
+		expect(retried.shards.map(shard => shard.branchName)).toEqual([null, null]);
 	});
 });
 

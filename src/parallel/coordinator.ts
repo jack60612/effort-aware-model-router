@@ -247,7 +247,9 @@ export class ParallelCoordinator {
 		this.createReviewWorktree =
 			dependencies.createReviewWorktree ??
 			(async (repoRoot, branchName, worktreeId) => {
-				const dir = path.join(os.tmpdir(), `omp-parallel-review-${worktreeId}`);
+				// Unique per attempt: a leftover registration from an interrupted
+				// review must never block a retry's `git worktree add`.
+				const dir = path.join(os.tmpdir(), `omp-parallel-review-${worktreeId}-${randomUUID().slice(0, 8)}`);
 				const result = await this.host.exec("git", [
 					"-C",
 					repoRoot,
@@ -430,6 +432,10 @@ export class ParallelCoordinator {
 	private async resumeInner(runId: string): Promise<ParallelRunSnapshot> {
 		let stored = this.requireRun(runId);
 		if (stored.run.status === "integrated" || stored.run.status === "cancelled") return stored;
+		// A failed run has nothing the scheduler can requeue: failed shards are
+		// never redispatched, and an integration failure must keep its
+		// `lastError` so the operator retries via an explicit `integrate`.
+		if (stored.run.status === "failed") return stored;
 
 		// Requeue rows abandoned by a dead process; branch artifacts survive.
 		for (const shard of stored.shards) {
@@ -553,15 +559,27 @@ export class ParallelCoordinator {
 
 			// Branch and base SHA are durable before any review dispatch.
 			const requiresReview = shard.review?.required === true;
+			const noChanges = commit === null;
 			this.store.updateShard(runId, shard.id, {
-				status: requiresReview ? "review_pending" : "completed",
+				status: requiresReview && !noChanges ? "review_pending" : "completed",
 				branchName: commit?.branchName ?? null,
 				baseSha: commit?.baseSha ?? null,
 				outputExcerpt: output,
 			});
 
 			if (shard.review !== undefined && !signal.aborted) {
-				await this.runReview(runId, plan, shard, index, repoRoot, agentsByName, signal);
+				if (noChanges) {
+					// Nothing to review: approve the declared review so the run
+					// can still reach ready_to_integrate.
+					this.store.updateReview(runId, shard.id, {
+						status: "approved",
+						summary: "No changes produced; review skipped.",
+						findings: [],
+						error: null,
+					});
+				} else {
+					await this.runReview(runId, plan, shard, index, repoRoot, agentsByName, signal);
+				}
 			}
 		} catch (error) {
 			this.store.updateShard(runId, shard.id, {
@@ -749,7 +767,17 @@ export class ParallelCoordinator {
 			const conflicted =
 				result.failed.length > 0 || result.conflict !== undefined || result.stashConflict !== undefined;
 			// Only branches that actually merged are ever cleaned up.
-			if (result.merged.length > 0) await this.cleanupTaskBranches(repoRoot, result.merged);
+			if (result.merged.length > 0) {
+				await this.cleanupTaskBranches(repoRoot, result.merged);
+				// Merged branches are gone; clear them so a later integrate
+				// retry resubmits only the branches that did not merge.
+				const mergedSet = new Set(result.merged);
+				for (const shard of stored.shards) {
+					if (shard.branchName !== null && mergedSet.has(shard.branchName)) {
+						this.store.updateShard(runId, shard.shardId, { branchName: null });
+					}
+				}
+			}
 			if (conflicted) {
 				this.store.updateRun(runId, {
 					status: "failed",
