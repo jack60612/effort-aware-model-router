@@ -21,6 +21,7 @@ import { classifyPromptEffort } from "./classifier";
 import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, type RouteEffort, type RouterConfig } from "./config";
 import { type DelegationPlan, loadRepositoryAgentIndex, planDelegation } from "./delegation";
 import { aggregateUsage, shouldSampleShadow, snapshotUsage, type UsageSnapshot } from "./measurement";
+import { type ParallelCommandDependencies, registerParallelCommand } from "./parallel/commands";
 import {
 	clampEffortToModel,
 	estimatePromptTokens,
@@ -118,6 +119,8 @@ export interface ModelRouterExtensionDependencies {
 	execute?: typeof runSubprocess;
 	loadAgentIndex?: typeof loadRepositoryAgentIndex;
 	random?: () => number;
+	/** Seams for the `/parallel` workflow command; defaults build the real per-cwd coordinator. */
+	parallel?: ParallelCommandDependencies;
 }
 
 /** Successfully applied route: the model now active for the prompt plus its applied efforts. */
@@ -1098,6 +1101,11 @@ export function createModelRouterExtension(
 				ctx.ui.notify(COMMAND_USAGE, "warning");
 			},
 		});
+
+		// `/parallel` is fully independent of `/route`: contract-first parallel
+		// workflows with one coordinator per working directory. It never touches
+		// router session state, and every failure surfaces as a UI warning.
+		registerParallelCommand(pi, dependencies.parallel);
 
 		const handleSessionLifecycle = (
 			_event: SessionStartEvent | SessionBranchEvent | SessionTreeEvent,

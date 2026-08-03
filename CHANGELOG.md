@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `/parallel` command for contract-first parallel agent workflows: YAML manifests with contract/path ownership validation, isolated per-shard worktree execution, read-only review gates, explicit no-auto-merge integration, durable per-repository SQLite run state with interruption recovery, and cancellation — all through public OMP extension APIs with no fork or core patch.
+
 ### Changed
 
 - Updated `/route setup` to use selectable model boxes instead of freeform model entry and replaced the raw cooldown-milliseconds field with human-readable timing presets.

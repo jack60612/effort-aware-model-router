@@ -172,6 +172,67 @@ Other slash commands are not classified. In particular, normal `/model <selector
 
 The setup wizard writes either the project file `<cwd>/.omp/model-router.json` or the user file `~/.omp/agent/model-router.json`, depending on the selected scope. Existing router fields are updated while unrelated top-level fields and unknown nested threshold, profile, and delegation fields — including `delegation.measurement` — are preserved.
 
+## Parallel workflows
+
+`/parallel` runs contract-first parallel agent workflows: a YAML manifest declares independent work shards, each shard executes in its own isolated Git worktree via OMP's public task executor, optional read-only reviewers gate each shard, and nothing reaches your branch until you explicitly integrate. Like the rest of this extension, it uses only public OMP APIs — **no fork and no OMP core patch** — and it never touches `/route` state or routing behavior.
+
+### Manifest schema
+
+A manifest is a YAML (or JSON) document validated strictly; unknown keys are rejected:
+
+```yaml
+run: checkout-revamp          # run name: lowercase id, [a-z0-9-], max 64 chars
+model: mock/base              # optional; omitted → the router's current model selector
+maxConcurrency: 4             # integer 1–32; bounds each dispatch wave
+contracts:
+  - id: cart-api              # contract id, same id grammar
+    description: Cart REST contract shared by both shards
+    owner: api                # must name exactly one declared shard
+shards:
+  - id: api                   # shard id, unique per manifest
+    kind: implementation      # free-form label, max 64 chars
+    agent: task               # discovered agent name; must exist at plan time
+    prompt: Implement the cart API.   # task text, max 20000 chars
+    owns: [src/api]           # paths this shard may modify
+    produces: [cart-api]      # contract ids this shard delivers
+    requires: []              # contract ids this shard consumes
+    dependsOn: []             # shard ids that must finish first
+  - id: ui
+    kind: implementation
+    agent: task
+    prompt: Build the cart UI against the cart-api contract.
+    owns: [src/ui]
+    produces: []
+    requires: [cart-api]
+    dependsOn: [api]
+    review:                   # optional per-shard review gate
+      agent: reviewer         # discovered agent; if required, must be read-only
+      required: true          # required rejection blocks integration
+```
+
+**Contract and path ownership rules.** Every contract `owner` must be a declared shard. `owns` paths are normalized to project-relative POSIX form; absolute paths, drive letters, backslashes, `..` traversal, and duplicates are rejected. Two shards may not own the same or nested paths, so parallel edits cannot collide. `dependsOn` must be acyclic and may only name declared shards. The validated plan is hashed (`planHash`) and stored immutably with the run.
+
+### Command lifecycle
+
+| Command | Effect |
+| --- | --- |
+| `/parallel plan <manifest.yaml> [--json]` | Load and validate the manifest, preflight it against discovered agents (shard agents exist, reviewers exist, required reviewers are read-only), and persist a `planned` run. Never dispatches work. |
+| `/parallel resume <run-id> [--wait] [--json]` | Dispatch dependency-ready shards in bounded waves. Each shard runs in an isolated worktree and commits to its own task branch. Also requeues rows interrupted by a dead process. |
+| `/parallel status [run-id] [--json]` | Bounded listing of all stored runs, or one run's shard/review detail. `--json` emits a machine-readable snapshot. |
+| `/parallel review <run-id> [--wait] [--json]` | Retry non-approved reviews for shards that already produced results. Reviewers run read-only against a temporary detached worktree of the shard branch and must return a strict JSON verdict. |
+| `/parallel integrate <run-id> [--wait] [--json]` | Explicitly merge a fully approved run's task branches in manifest order. This is the **only** command that merges. A conflict fails the run and preserves every branch for manual recovery. |
+| `/parallel cancel <run-id> [--json]` | Abort in-flight work and mark every nonterminal shard, review, and the run cancelled. Cancelled runs cannot be integrated. |
+
+Arguments are parsed by whitespace tokenization only — no shell evaluation, quoting, or expansion. `resume`, `review`, and `integrate` return control immediately and notify when the background operation settles; add `--wait` to block until the final state. Completions cover subcommands and the run IDs already stored for the session's working directories. All failures surface as UI warnings.
+
+### Review and integration are explicit
+
+A completed shard with a `required` review stays gated until its reviewer approves; a rejection leaves the run in `review_pending` for another `/parallel review` round after fixes. Nothing is ever auto-merged: even a fully approved run waits for an explicit `/parallel integrate`. Integration merges shard task branches in manifest order and cleans up only branches that actually merged.
+
+### State, recovery, and cancellation
+
+Run state lives in a plugin-owned SQLite database under `$XDG_STATE_HOME/omp/parallel/` (default `~/.local/state/omp/parallel/`), one file per repository root named by a stable hash key — raw project paths never appear in state filenames. One coordinator and store are kept per working directory. On reopen, rows left `running` by a dead process are marked `interrupted` with their branch names, base SHAs, and outputs preserved; `/parallel resume <run-id>` requeues them. `/parallel cancel` aborts active subagents and settles the run without merging; branch artifacts survive cancellation for manual inspection.
+
 ## Manual model changes and same-model ambiguity
 
 While in `auto`, the router compares the current model with its last observed and last automatic model before it classifies the next eligible typed prompt. A different model selected outside the extension is inferred as a manual choice on that next prompt. The router enters `manual`, pins that model, and updates the baseline instead of routing the prompt.

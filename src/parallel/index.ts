@@ -22,6 +22,25 @@ export {
 	validateParallelWorkflowManifest,
 } from "./contracts";
 export {
+	formatParallelRunSnapshot,
+	formatParallelRunSummaries,
+	PARALLEL_COMMAND_NAME,
+	PARALLEL_COMMAND_USAGE,
+	PARALLEL_STATUS_MAX_ROWS,
+	PARALLEL_STATUS_MAX_RUNS,
+	PARALLEL_STATUS_TEXT_MAX_CHARS,
+	type ParallelCommandCoordinator,
+	type ParallelCommandDependencies,
+	type ParallelCommandRuntime,
+	type ParallelParseError,
+	type ParallelParsedCommand,
+	parallelArgumentCompletions,
+	parallelSnapshotToJson,
+	parallelSummariesToJson,
+	parseParallelCommandArgs,
+	registerParallelCommand,
+} from "./commands";
+export {
 	buildParallelReviewPrompt,
 	PARALLEL_REVIEW_OUTPUT_MAX_CHARS,
 	ParallelCoordinator,
