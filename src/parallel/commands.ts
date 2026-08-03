@@ -199,14 +199,16 @@ export function parallelSnapshotToJson(stored: ParallelStoredRun): string {
 		lastError: stored.run.lastError === null ? null : clip(stored.run.lastError),
 		createdAt: stored.run.createdAt,
 		updatedAt: stored.run.updatedAt,
-		shards: stored.shards.map(shard => ({
+		shardsTotal: stored.shards.length,
+		shards: stored.shards.slice(0, PARALLEL_STATUS_MAX_ROWS).map(shard => ({
 			shardId: shard.shardId,
 			status: shard.status,
 			branchName: shard.branchName,
 			baseSha: shard.baseSha,
 			error: shard.error === null ? null : clip(shard.error),
 		})),
-		reviews: stored.reviews.map(review => ({
+		reviewsTotal: stored.reviews.length,
+		reviews: stored.reviews.slice(0, PARALLEL_STATUS_MAX_ROWS).map(review => ({
 			shardId: review.shardId,
 			agent: review.agent,
 			status: review.status,

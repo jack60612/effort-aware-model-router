@@ -5,6 +5,7 @@ import {
 	formatParallelRunSnapshot,
 	formatParallelRunSummaries,
 	PARALLEL_COMMAND_USAGE,
+	PARALLEL_STATUS_MAX_ROWS,
 	PARALLEL_STATUS_MAX_RUNS,
 	PARALLEL_STATUS_TEXT_MAX_CHARS,
 	type ParallelCommandCoordinator,
@@ -369,6 +370,8 @@ describe("parallel command formatting", () => {
 		const snapshot = JSON.parse(parallelSnapshotToJson(stored));
 		expect(snapshot.runId).toBe("run-1");
 		expect(snapshot.name).toBe("test-run");
+		expect(snapshot.shardsTotal).toBe(1);
+		expect(snapshot.reviewsTotal).toBe(1);
 		expect(snapshot.shards[0].error.length).toBe(PARALLEL_STATUS_TEXT_MAX_CHARS);
 		expect(snapshot.reviews[0].findingsCount).toBe(0);
 		const summaries = JSON.parse(parallelSummariesToJson([makeSummary("run-2", "failed", "boom")]));
@@ -383,6 +386,24 @@ describe("parallel command formatting", () => {
 				updatedAt: 2,
 			},
 		]);
+	});
+
+	it("caps JSON shard and review rows on oversized snapshots", () => {
+		const rows = PARALLEL_STATUS_MAX_ROWS + 25;
+		const stored = makeStored("run-big", "running", {
+			shards: Array.from({ length: rows }, (_, index) => ({ shardId: `shard-${index}`, status: "pending" as const })),
+			reviews: Array.from({ length: rows }, (_, index) => ({
+				shardId: `shard-${index}`,
+				agent: "reviewer",
+				status: "pending",
+			})),
+		});
+		const snapshot = JSON.parse(parallelSnapshotToJson(stored));
+		expect(snapshot.shards).toHaveLength(PARALLEL_STATUS_MAX_ROWS);
+		expect(snapshot.reviews).toHaveLength(PARALLEL_STATUS_MAX_ROWS);
+		expect(snapshot.shardsTotal).toBe(rows);
+		expect(snapshot.reviewsTotal).toBe(rows);
+		expect(snapshot.shards.at(-1).shardId).toBe(`shard-${PARALLEL_STATUS_MAX_ROWS - 1}`);
 	});
 });
 
@@ -438,7 +459,6 @@ describe("parallel command handler", () => {
 		expect(harness.notifications[0].message).toContain("Parallel workflows:");
 		expect(harness.notifications[0].message).toContain("shards must declare at least one shard");
 
-		harness.coordinator.createRunResult = new Error("Parallel coordinator: preflight failed: missing agent");
 		const okManifest = new CommandHarness();
 		okManifest.coordinator.createRunResult = new Error("Parallel coordinator: preflight failed: missing agent");
 		await okManifest.command("plan m.yml");
