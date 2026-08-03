@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type AssistantMessage, completeSimple, type Model } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, completeSimple, type Model, type Usage } from "@oh-my-pi/pi-ai";
 import { type ClassifierComplete, type ClassifierModelRegistry, preprocessClassifierInput } from "./classifier";
 import type { RouterDelegationConfig } from "./config";
 
@@ -16,7 +16,9 @@ export interface DelegationAgentOption {
 	description?: string;
 }
 
-export type DelegationPlan = { delegate: false; reason: string } | { delegate: true; agent: string; task: string };
+export type DelegationPlan =
+	| { delegate: false; reason: string; usage?: Usage }
+	| { delegate: true; agent: string; task: string; usage?: Usage };
 
 export type DelegationPlannerConfig = Pick<RouterDelegationConfig, "plannerTimeoutMs">;
 
@@ -181,7 +183,7 @@ export async function planDelegation(
 			text.length > PARSE_ERROR_EXCERPT_MAX_CHARS ? `${text.slice(0, PARSE_ERROR_EXCERPT_MAX_CHARS)}…` : text;
 		throw new Error(`model-router: unparseable delegation plan: ${JSON.stringify(excerpt)}`);
 	}
-	return plan;
+	return { ...plan, usage: response.usage };
 }
 
 function extractText(content: AssistantMessage["content"]): string {

@@ -36,6 +36,20 @@ function response(text: string, overrides: Partial<AssistantMessage> = {}): Assi
 		...overrides,
 	} as AssistantMessage;
 }
+const completePlannerUsage: AssistantMessage["usage"] = {
+	input: 120,
+	output: 34,
+	cacheRead: 56,
+	cacheWrite: 7,
+	totalTokens: 217,
+	cost: {
+		input: 0.12,
+		output: 0.34,
+		cacheRead: 0.056,
+		cacheWrite: 0.007,
+		total: 0.523,
+	},
+};
 
 const baseConfig = { plannerTimeoutMs: 7_000 } as const;
 
@@ -246,7 +260,7 @@ describe("planDelegation", () => {
 		});
 		const complete: ClassifierComplete = async (candidate, context, options) => {
 			completionCalls.push({ model: candidate, context, options });
-			return response('{"delegate":true,"agent":"scout","task":"map the repo"}');
+			return response('{"delegate":true,"agent":"scout","task":"map the repo"}', { usage: completePlannerUsage });
 		};
 
 		const plan = await planDelegation("map the repo", model, baseAgents, "index text", baseConfig, ctx, {
@@ -258,7 +272,7 @@ describe("planDelegation", () => {
 			},
 		});
 
-		expect(plan).toEqual({ delegate: true, agent: "scout", task: "map the repo" });
+		expect(plan).toEqual({ delegate: true, agent: "scout", task: "map the repo", usage: completePlannerUsage });
 		expect(timeoutRequests).toEqual([7_000]);
 		expect(keyChecks).toEqual([{ model, sessionId: "session-42", signal: injectedTimeoutSignal }]);
 		expect(resolverCalls).toEqual([{ model, sessionId: "session-42" }]);
@@ -342,7 +356,7 @@ describe("planDelegation", () => {
 				now: () => 1,
 				timeoutSignal: () => new AbortController().signal,
 			}),
-		).resolves.toEqual({ delegate: false, reason: "needs prior context" });
+		).resolves.toEqual({ delegate: false, reason: "needs prior context", usage: {} });
 	});
 
 	it("throws on missing credentials without calling complete", async () => {
