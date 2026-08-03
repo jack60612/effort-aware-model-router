@@ -6,7 +6,6 @@ import type {
 	MergeBranchResult,
 	WorktreeBaseline,
 } from "@oh-my-pi/pi-coding-agent/task/worktree";
-import { type ParallelWorkflowPlan, validateParallelWorkflowManifest } from "../src/parallel/index";
 import {
 	ParallelCoordinator,
 	type ParallelCoordinatorDependencies,
@@ -16,6 +15,7 @@ import {
 	type ParallelSubagentResult,
 	parseParallelReviewVerdict,
 } from "../src/parallel/coordinator";
+import { type ParallelWorkflowPlan, validateParallelWorkflowManifest } from "../src/parallel/index";
 import type {
 	ParallelCreateRunInput,
 	ParallelReviewPatch,
@@ -37,7 +37,10 @@ interface ShardInput {
 	review?: { agent: string; required: boolean };
 }
 
-function makePlan(shards: ShardInput[], options: { maxConcurrency?: number; model?: string } = {}): ParallelWorkflowPlan {
+function makePlan(
+	shards: ShardInput[],
+	options: { maxConcurrency?: number; model?: string } = {},
+): ParallelWorkflowPlan {
 	return validateParallelWorkflowManifest(
 		{
 			run: "test-run",
@@ -62,7 +65,10 @@ function makePlan(shards: ShardInput[], options: { maxConcurrency?: number; mode
 
 /** Deterministic in-memory store implementing the coordinator's store seam. */
 class FakeStore implements ParallelCoordinatorStore {
-	private readonly runs = new Map<string, { record: ParallelStoredRun["run"]; shards: ParallelShardRecord[]; reviews: ParallelReviewRecord[] }>();
+	private readonly runs = new Map<
+		string,
+		{ record: ParallelStoredRun["run"]; shards: ParallelShardRecord[]; reviews: ParallelReviewRecord[] }
+	>();
 
 	createRun(input: ParallelCreateRunInput): ParallelStoredRun {
 		if (this.runs.has(input.runId)) throw new Error(`run "${input.runId}" already exists`);
@@ -229,7 +235,12 @@ function makeHarness(options: HarnessOptions = {}) {
 		captureBaseline: async () => BASELINE,
 		ensureIsolation: async (_baseCwd, id): Promise<IsolationHandle> => {
 			events.push(`ensure:${id}`);
-			return { mergedDir: `/iso/${id}`, backend: 0 as IsolationHandle["backend"], fellBack: false, fallbackReason: null };
+			return {
+				mergedDir: `/iso/${id}`,
+				backend: 0 as IsolationHandle["backend"],
+				fellBack: false,
+				fallbackReason: null,
+			};
 		},
 		cleanupIsolation: async handle => {
 			events.push(`cleanup:${handle.mergedDir}`);
@@ -315,10 +326,7 @@ describe("parallel coordinator dispatch", () => {
 				return okResult(`done:${request.id}`);
 			},
 		});
-		const plan = makePlan(
-			[{ id: "a" }, { id: "b" }, { id: "c", dependsOn: ["a", "b"] }],
-			{ maxConcurrency: 1 },
-		);
+		const plan = makePlan([{ id: "a" }, { id: "b" }, { id: "c", dependsOn: ["a", "b"] }], { maxConcurrency: 1 });
 		const created = await harness.coordinator.createRun(plan);
 		const resumePromise = harness.coordinator.resume(created.run.runId);
 
@@ -377,7 +385,9 @@ describe("parallel coordinator dispatch", () => {
 		expect(harness.events).toContain("cleanup:/iso/run-1-good");
 		expect(harness.events).toContain("cleanup:/iso/run-1-boom");
 		// Commit ordering: ensure -> run -> commit -> cleanup for the success.
-		const sequence = harness.events.filter(event => event.endsWith("run-1-good") || event === "cleanup:/iso/run-1-good");
+		const sequence = harness.events.filter(
+			event => event.endsWith("run-1-good") || event === "cleanup:/iso/run-1-good",
+		);
 		expect(sequence).toEqual(["ensure:run-1-good", "run:run-1-good", "commit:run-1-good", "cleanup:/iso/run-1-good"]);
 	});
 
@@ -401,8 +411,7 @@ describe("parallel coordinator dispatch", () => {
 describe("parallel coordinator reviews", () => {
 	it("runs required reviews in a temporary worktree and always removes it", async () => {
 		const harness = makeHarness({
-			runSubagent: async request =>
-				request.id.endsWith("-review") ? okResult(REVIEW_OK) : okResult("did work"),
+			runSubagent: async request => (request.id.endsWith("-review") ? okResult(REVIEW_OK) : okResult("did work")),
 		});
 		const plan = makePlan([{ id: "a", review: { agent: "reviewer", required: true } }]);
 		const created = await harness.coordinator.createRun(plan);
@@ -424,8 +433,7 @@ describe("parallel coordinator reviews", () => {
 	it("a rejected required review leaves the run review_pending and review() retries it", async () => {
 		let verdict = REVIEW_REJECT;
 		const harness = makeHarness({
-			runSubagent: async request =>
-				request.id.endsWith("-review") ? okResult(verdict) : okResult("did work"),
+			runSubagent: async request => (request.id.endsWith("-review") ? okResult(verdict) : okResult("did work")),
 		});
 		const plan = makePlan([{ id: "a", review: { agent: "reviewer", required: true } }]);
 		const created = await harness.coordinator.createRun(plan);
@@ -471,7 +479,9 @@ describe("parallel coordinator reviews", () => {
 		expect(parseParallelReviewVerdict('{"approved":"yes","summary":"s","findings":[]}')).toBeNull();
 		expect(parseParallelReviewVerdict('{"approved":true,"summary":"s"}')).toBeNull();
 		expect(parseParallelReviewVerdict('{"approved":true,"summary":"s","findings":[{"message":"m"}]}')).toBeNull();
-		expect(parseParallelReviewVerdict(`{"approved":true,"summary":"s","findings":[]}${" ".repeat(100_001)}`)).toBeNull();
+		expect(
+			parseParallelReviewVerdict(`{"approved":true,"summary":"s","findings":[]}${" ".repeat(100_001)}`),
+		).toBeNull();
 	});
 });
 
@@ -486,7 +496,14 @@ describe("parallel coordinator cancellation", () => {
 				new Promise<ParallelSubagentResult>(resolve => {
 					started?.();
 					request.signal.addEventListener("abort", () => {
-						resolve({ exitCode: 1, output: "", stderr: "", aborted: true, abortReason: "cancelled", durationMs: 1 });
+						resolve({
+							exitCode: 1,
+							output: "",
+							stderr: "",
+							aborted: true,
+							abortReason: "cancelled",
+							durationMs: 1,
+						});
 					});
 				}),
 		});
@@ -518,8 +535,7 @@ describe("parallel coordinator integration", () => {
 
 	it("merges branches in manifest order and cleans up merged branches on success", async () => {
 		const harness = makeHarness({
-			runSubagent: async request =>
-				request.id.endsWith("-review") ? okResult(REVIEW_OK) : okResult("did work"),
+			runSubagent: async request => (request.id.endsWith("-review") ? okResult(REVIEW_OK) : okResult("did work")),
 		});
 		const plan = makePlan([{ id: "a", review: { agent: "reviewer", required: true } }, { id: "b" }]);
 		const created = await harness.coordinator.createRun(plan);
@@ -555,8 +571,7 @@ describe("parallel coordinator integration", () => {
 describe("parallel coordinator recovery and status", () => {
 	it("resume requeues interrupted rows and finishes them", async () => {
 		const harness = makeHarness({
-			runSubagent: async request =>
-				request.id.endsWith("-review") ? okResult(REVIEW_OK) : okResult("did work"),
+			runSubagent: async request => (request.id.endsWith("-review") ? okResult(REVIEW_OK) : okResult("did work")),
 		});
 		const plan = makePlan([{ id: "a", review: { agent: "reviewer", required: true } }]);
 		const created = await harness.coordinator.createRun(plan);

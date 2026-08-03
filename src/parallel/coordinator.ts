@@ -3,11 +3,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type AgentDefinition, isReadOnlyAgent, type SingleResult } from "@oh-my-pi/pi-coding-agent/task";
 import {
+	type CommitToBranchResult,
 	captureBaseline,
 	cleanupIsolation,
 	cleanupTaskBranches,
 	commitToBranch,
-	type CommitToBranchResult,
 	ensureIsolation,
 	getRepoRoot,
 	type IsolationHandle,
@@ -15,8 +15,13 @@ import {
 	mergeTaskBranches,
 	type WorktreeBaseline,
 } from "@oh-my-pi/pi-coding-agent/task/worktree";
-import type { ParallelShardSpec, ParallelRunStatus, ParallelWorkflowPlan } from "./contracts";
-import { decideParallelSchedule, type ParallelReviewFinding, type ParallelReviewState, type ParallelShardState } from "./scheduler";
+import type { ParallelRunStatus, ParallelShardSpec, ParallelWorkflowPlan } from "./contracts";
+import {
+	decideParallelSchedule,
+	type ParallelReviewFinding,
+	type ParallelReviewState,
+	type ParallelShardState,
+} from "./scheduler";
 import type {
 	ParallelCreateRunInput,
 	ParallelReviewPatch,
@@ -243,7 +248,15 @@ export class ParallelCoordinator {
 			dependencies.createReviewWorktree ??
 			(async (repoRoot, branchName, worktreeId) => {
 				const dir = path.join(os.tmpdir(), `omp-parallel-review-${worktreeId}`);
-				const result = await this.host.exec("git", ["-C", repoRoot, "worktree", "add", "--detach", dir, branchName]);
+				const result = await this.host.exec("git", [
+					"-C",
+					repoRoot,
+					"worktree",
+					"add",
+					"--detach",
+					dir,
+					branchName,
+				]);
 				if (result.exitCode !== 0) {
 					throw coordinatorError(`failed to create review worktree for ${branchName}: ${result.stderr.trim()}`);
 				}
@@ -382,10 +395,12 @@ export class ParallelCoordinator {
 			this.active.set(runId, set);
 		}
 		set.add(promise);
-		void promise.catch(() => undefined).finally(() => {
-			set.delete(promise);
-			if (set.size === 0 && this.active.get(runId) === set) this.active.delete(runId);
-		});
+		void promise
+			.catch(() => undefined)
+			.finally(() => {
+				set.delete(promise);
+				if (set.size === 0 && this.active.get(runId) === set) this.active.delete(runId);
+			});
 	}
 
 	private requireRun(runId: string): ParallelStoredRun {
@@ -434,7 +449,9 @@ export class ParallelCoordinator {
 
 			const plan = stored.run.plan;
 			const indexByShardId = new Map<string, number>();
-			plan.shards.forEach((shard, index) => indexByShardId.set(shard.id, index));
+			plan.shards.forEach((shard, index) => {
+				indexByShardId.set(shard.id, index);
+			});
 
 			while (!controller.signal.aborted) {
 				stored = this.requireRun(runId);
@@ -456,7 +473,15 @@ export class ParallelCoordinator {
 				if (decision.ready.length === 0) break;
 				await Promise.allSettled(
 					decision.ready.map(shard =>
-						this.processShard(runId, plan, shard, indexByShardId.get(shard.id) ?? 0, repoRoot, agentsByName, controller.signal),
+						this.processShard(
+							runId,
+							plan,
+							shard,
+							indexByShardId.get(shard.id) ?? 0,
+							repoRoot,
+							agentsByName,
+							controller.signal,
+						),
 					),
 				);
 			}
@@ -644,7 +669,9 @@ export class ParallelCoordinator {
 		const reviewsByShardId = new Map(stored.reviews.map(review => [review.shardId, review]));
 		const shardsById = new Map(stored.shards.map(shard => [shard.shardId, shard]));
 		const indexByShardId = new Map<string, number>();
-		plan.shards.forEach((shard, index) => indexByShardId.set(shard.id, index));
+		plan.shards.forEach((shard, index) => {
+			indexByShardId.set(shard.id, index);
+		});
 
 		const controller = this.registerController(runId);
 		try {
@@ -696,7 +723,9 @@ export class ParallelCoordinator {
 				throw coordinatorError(`cannot integrate run "${runId}": shard "${shard.id}" is ${status ?? "missing"}`);
 			}
 			if (shard.review?.required === true && reviewsByShardId.get(shard.id)?.status !== "approved") {
-				throw coordinatorError(`cannot integrate run "${runId}": required review for shard "${shard.id}" is not approved`);
+				throw coordinatorError(
+					`cannot integrate run "${runId}": required review for shard "${shard.id}" is not approved`,
+				);
 			}
 		}
 
@@ -717,16 +746,15 @@ export class ParallelCoordinator {
 		this.store.updateRun(runId, { status: "integrating", lastError: null });
 		try {
 			const result = await this.mergeTaskBranches(repoRoot, branches);
-			const conflicted = result.failed.length > 0 || result.conflict !== undefined || result.stashConflict !== undefined;
+			const conflicted =
+				result.failed.length > 0 || result.conflict !== undefined || result.stashConflict !== undefined;
 			// Only branches that actually merged are ever cleaned up.
 			if (result.merged.length > 0) await this.cleanupTaskBranches(repoRoot, result.merged);
 			if (conflicted) {
 				this.store.updateRun(runId, {
 					status: "failed",
 					lastError:
-						result.conflict ??
-						result.stashConflict ??
-						`merge failed for branches: ${result.failed.join(", ")}`,
+						result.conflict ?? result.stashConflict ?? `merge failed for branches: ${result.failed.join(", ")}`,
 				});
 			} else {
 				this.store.updateRun(runId, { status: "integrated", lastError: null });

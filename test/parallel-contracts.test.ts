@@ -245,9 +245,9 @@ describe("validateParallelWorkflowManifest", () => {
 	});
 
 	it("rejects a contract whose owner shard does not produce it", () => {
-		expect(() =>
-			validateParallelWorkflowManifest(manifest({ shards: [shard({ produces: [] })] }), SOURCE),
-		).toThrow(/does not list it in produces/);
+		expect(() => validateParallelWorkflowManifest(manifest({ shards: [shard({ produces: [] })] }), SOURCE)).toThrow(
+			/does not list it in produces/,
+		);
 	});
 
 	it("rejects produces entries that name unknown contracts", () => {
@@ -298,10 +298,7 @@ describe("validateParallelWorkflowManifest", () => {
 
 	it("rejects self-referential and unknown dependencies", () => {
 		expect(() =>
-			validateParallelWorkflowManifest(
-				manifest({ shards: [shard({ dependsOn: ["delegation-config"] })] }),
-				SOURCE,
-			),
+			validateParallelWorkflowManifest(manifest({ shards: [shard({ dependsOn: ["delegation-config"] })] }), SOURCE),
 		).toThrow(/shard "delegation-config" depends on itself/);
 		expect(() =>
 			validateParallelWorkflowManifest(manifest({ shards: [shard({ dependsOn: ["ghost"] })] }), SOURCE),
@@ -355,9 +352,9 @@ describe("validateParallelWorkflowManifest", () => {
 					validateParallelWorkflowManifest(manifest({ shards: [shard({ owns: [owned] })] }), SOURCE),
 				).toThrow(message);
 			}
-			expect(() =>
-				validateParallelWorkflowManifest(manifest({ shards: [shard({ owns: [42] })] }), SOURCE),
-			).toThrow(/shards\[0\]\.owns\[0\] must be a string path/);
+			expect(() => validateParallelWorkflowManifest(manifest({ shards: [shard({ owns: [42] })] }), SOURCE)).toThrow(
+				/shards\[0\]\.owns\[0\] must be a string path/,
+			);
 		});
 
 		it("normalizes dot segments, duplicate slashes, and trailing slashes", () => {
@@ -451,10 +448,7 @@ describe("validateParallelWorkflowManifest", () => {
 				),
 			).toThrow(/shards\[0\]\.review\.required must be a boolean/);
 			expect(() =>
-				validateParallelWorkflowManifest(
-					manifest({ shards: [shard({ review: { agent: "reviewer" } })] }),
-					SOURCE,
-				),
+				validateParallelWorkflowManifest(manifest({ shards: [shard({ review: { agent: "reviewer" } })] }), SOURCE),
 			).toThrow(/shards\[0\]\.review\.required must be a boolean/);
 		});
 
@@ -535,9 +529,7 @@ describe("loadParallelWorkflowManifest", () => {
 	});
 
 	it("reports an actionable error for a missing file", async () => {
-		expect(loadParallelWorkflowManifest("/nonexistent/manifest.yml")).rejects.toThrow(
-			/unable to read manifest file/,
-		);
+		expect(loadParallelWorkflowManifest("/nonexistent/manifest.yml")).rejects.toThrow(/unable to read manifest file/);
 	});
 });
 
@@ -590,17 +582,11 @@ shards:
 	it("hashes shard order: reordering shards is a different plan", () => {
 		const twoShards = manifest({
 			contracts: [],
-			shards: [
-				shard({ id: "a", owns: ["a.ts"], produces: [] }),
-				shard({ id: "b", owns: ["b.ts"], produces: [] }),
-			],
+			shards: [shard({ id: "a", owns: ["a.ts"], produces: [] }), shard({ id: "b", owns: ["b.ts"], produces: [] })],
 		});
 		const reversed = manifest({
 			contracts: [],
-			shards: [
-				shard({ id: "b", owns: ["b.ts"], produces: [] }),
-				shard({ id: "a", owns: ["a.ts"], produces: [] }),
-			],
+			shards: [shard({ id: "b", owns: ["b.ts"], produces: [] }), shard({ id: "a", owns: ["a.ts"], produces: [] })],
 		});
 
 		const planA = validateParallelWorkflowManifest(twoShards, SOURCE);
@@ -701,15 +687,9 @@ describe("decideParallelSchedule", () => {
 		const plan = validateParallelWorkflowManifest(chainedManifest(), SOURCE);
 		const completed = [shardState("delegation-config", "completed")];
 
-		const pendingReview = decideParallelSchedule(plan, completed, [
-			reviewState("delegation-config", "pending"),
-		]);
-		const rejectedReview = decideParallelSchedule(plan, completed, [
-			reviewState("delegation-config", "rejected"),
-		]);
-		const approvedReview = decideParallelSchedule(plan, completed, [
-			reviewState("delegation-config", "approved"),
-		]);
+		const pendingReview = decideParallelSchedule(plan, completed, [reviewState("delegation-config", "pending")]);
+		const rejectedReview = decideParallelSchedule(plan, completed, [reviewState("delegation-config", "rejected")]);
+		const approvedReview = decideParallelSchedule(plan, completed, [reviewState("delegation-config", "approved")]);
 
 		expect(pendingReview.ready).toEqual([]);
 		expect(rejectedReview.ready).toEqual([]);

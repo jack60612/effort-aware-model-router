@@ -1,9 +1,4 @@
-import type {
-	ParallelReviewStatus,
-	ParallelShardSpec,
-	ParallelShardStatus,
-	ParallelWorkflowPlan,
-} from "./contracts";
+import type { ParallelReviewStatus, ParallelShardSpec, ParallelShardStatus, ParallelWorkflowPlan } from "./contracts";
 
 export interface ParallelShardState {
 	id: string;

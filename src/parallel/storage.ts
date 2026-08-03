@@ -555,7 +555,11 @@ export class ParallelWorkflowStore {
 		}
 		if (patch.outputExcerpt !== undefined) {
 			assignments.push("output_excerpt = $outputExcerpt");
-			params.$outputExcerpt = optionalBoundedText(patch.outputExcerpt, "outputExcerpt", PARALLEL_STORE_OUTPUT_MAX_CHARS);
+			params.$outputExcerpt = optionalBoundedText(
+				patch.outputExcerpt,
+				"outputExcerpt",
+				PARALLEL_STORE_OUTPUT_MAX_CHARS,
+			);
 		}
 		if (patch.error !== undefined) {
 			assignments.push("error = $error");
@@ -629,10 +633,14 @@ export class ParallelWorkflowStore {
 		const timestamp = this.now();
 		this.db.transaction(() => {
 			this.db
-				.query("UPDATE workflow_reviews SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'")
+				.query(
+					"UPDATE workflow_reviews SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'",
+				)
 				.run({ $timestamp: timestamp });
 			this.db
-				.query("UPDATE workflow_shards SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'")
+				.query(
+					"UPDATE workflow_shards SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'",
+				)
 				.run({ $timestamp: timestamp });
 			this.db
 				.query("UPDATE workflow_runs SET status = 'interrupted', updated_at = $timestamp WHERE status = 'running'")
@@ -677,7 +685,9 @@ function migrate(db: Database): void {
 	const version = Number(row?.user_version ?? 0);
 	if (version === PARALLEL_STORE_SCHEMA_VERSION) return;
 	if (version !== 0) {
-		throw storeError(`unknown schema version ${version}; this build supports version ${PARALLEL_STORE_SCHEMA_VERSION}`);
+		throw storeError(
+			`unknown schema version ${version}; this build supports version ${PARALLEL_STORE_SCHEMA_VERSION}`,
+		);
 	}
 	db.transaction(() => {
 		for (const statement of SCHEMA_STATEMENTS) db.exec(statement);
@@ -717,7 +727,11 @@ function parseReviewRow(row: ReviewRow): ParallelReviewRecord {
 function extractRunName(planJson: string): string {
 	try {
 		const parsed = JSON.parse(planJson);
-		if (typeof parsed === "object" && parsed !== null && typeof (parsed as Record<string, unknown>).run === "string") {
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			typeof (parsed as Record<string, unknown>).run === "string"
+		) {
 			return (parsed as Record<string, unknown>).run as string;
 		}
 	} catch {

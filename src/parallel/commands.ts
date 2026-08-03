@@ -11,9 +11,9 @@ import {
 	type ParallelSubagentRunner,
 } from "./coordinator";
 import {
-	ParallelWorkflowStore,
 	type ParallelRunSummary,
 	type ParallelStoredRun,
+	ParallelWorkflowStore,
 	type ParallelWorkflowStoreOptions,
 } from "./storage";
 
@@ -70,7 +70,10 @@ function isSubcommand(value: string): value is ParallelSubcommand {
  * quoting, expansion, or shell evaluation of any kind is performed.
  */
 export function parseParallelCommandArgs(args: string): ParallelParsedCommand | ParallelParseError {
-	const tokens = args.trim().split(/\s+/).filter(token => token.length > 0);
+	const tokens = args
+		.trim()
+		.split(/\s+/)
+		.filter(token => token.length > 0);
 	const positionals: string[] = [];
 	let wait = false;
 	let json = false;
@@ -377,7 +380,10 @@ export function registerParallelCommand(pi: ExtensionAPI, dependencies: Parallel
 			const result = await coordinator.status(parsed.runId);
 			if (Array.isArray(result)) {
 				const summaries = result as readonly ParallelRunSummary[];
-				ctx.ui.notify(parsed.json ? parallelSummariesToJson(summaries) : formatParallelRunSummaries(summaries), "info");
+				ctx.ui.notify(
+					parsed.json ? parallelSummariesToJson(summaries) : formatParallelRunSummaries(summaries),
+					"info",
+				);
 				return;
 			}
 			const snapshot = result as ParallelRunSnapshot;

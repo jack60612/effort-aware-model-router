@@ -287,10 +287,7 @@ function validateContractOwnership(
 				fail(sourcePath, `shard "${shard.id}" produces unknown contract "${produced}"`);
 			}
 			if (contract.owner !== shard.id) {
-				fail(
-					sourcePath,
-					`shard "${shard.id}" produces contract "${produced}" owned by shard "${contract.owner}"`,
-				);
+				fail(sourcePath, `shard "${shard.id}" produces contract "${produced}" owned by shard "${contract.owner}"`);
 			}
 		}
 		for (const required of shard.requires) {
@@ -427,9 +424,7 @@ export function validateParallelWorkflowManifest(input: unknown, sourcePath: str
 	const run = requireId(ownValue(record, "run"), sourcePath, "run");
 	const modelValue = ownValue(record, "model");
 	const model =
-		modelValue === undefined
-			? undefined
-			: requireString(modelValue, sourcePath, "model", PARALLEL_MODEL_MAX_CHARS);
+		modelValue === undefined ? undefined : requireString(modelValue, sourcePath, "model", PARALLEL_MODEL_MAX_CHARS);
 	const maxConcurrency = ownValue(record, "maxConcurrency");
 	if (
 		typeof maxConcurrency !== "number" ||

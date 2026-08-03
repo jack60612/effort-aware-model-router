@@ -144,7 +144,10 @@ describe("parallel workflow lifecycle through the registered command", () => {
 		const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void> | void>();
 		const api = {
 			on(): void {},
-			registerCommand(name: string, options: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void }): void {
+			registerCommand(
+				name: string,
+				options: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void },
+			): void {
 				commands.set(name, options.handler);
 			},
 			registerMessageRenderer(): void {},

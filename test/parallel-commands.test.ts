@@ -51,7 +51,13 @@ function makeStored(
 		plan?: ParallelWorkflowPlan;
 		lastError?: string | null;
 		shards?: Array<Partial<ParallelShardRecord> & { shardId: string }>;
-		reviews?: Array<{ shardId: string; agent: string; status: string; summary?: string | null; error?: string | null }>;
+		reviews?: Array<{
+			shardId: string;
+			agent: string;
+			status: string;
+			summary?: string | null;
+			error?: string | null;
+		}>;
 	} = {},
 ): ParallelStoredRun {
 	const plan = options.plan ?? makePlan();
@@ -99,7 +105,11 @@ function makeSummary(runId: string, status: ParallelRunStatus, lastError: string
 	return { runId, runName: "test-run", status, planHash: "hash", lastError, createdAt: 1, updatedAt: 2 };
 }
 
-type Deferred = { promise: Promise<ParallelRunSnapshot>; resolve: (s: ParallelRunSnapshot) => void; reject: (e: Error) => void };
+type Deferred = {
+	promise: Promise<ParallelRunSnapshot>;
+	resolve: (s: ParallelRunSnapshot) => void;
+	reject: (e: Error) => void;
+};
 
 function deferred(): Deferred {
 	let resolve!: (s: ParallelRunSnapshot) => void;
@@ -296,7 +306,9 @@ describe("parallel command parsing", () => {
 			error: "--wait is only valid for resume/review/integrate",
 		});
 		expect(parseParallelCommandArgs("plan")).toEqual({ error: "plan requires exactly one manifest path" });
-		expect(parseParallelCommandArgs("plan a.yml b.yml")).toEqual({ error: "plan requires exactly one manifest path" });
+		expect(parseParallelCommandArgs("plan a.yml b.yml")).toEqual({
+			error: "plan requires exactly one manifest path",
+		});
 		expect(parseParallelCommandArgs("status run-1 run-2")).toEqual({ error: "status accepts at most one run ID" });
 		expect(parseParallelCommandArgs("resume")).toEqual({ error: "resume requires exactly one run ID" });
 		expect(parseParallelCommandArgs("integrate run-1 run-2")).toEqual({
@@ -391,7 +403,10 @@ describe("parallel command formatting", () => {
 	it("caps JSON shard and review rows on oversized snapshots", () => {
 		const rows = PARALLEL_STATUS_MAX_ROWS + 25;
 		const stored = makeStored("run-big", "running", {
-			shards: Array.from({ length: rows }, (_, index) => ({ shardId: `shard-${index}`, status: "pending" as const })),
+			shards: Array.from({ length: rows }, (_, index) => ({
+				shardId: `shard-${index}`,
+				status: "pending" as const,
+			})),
 			reviews: Array.from({ length: rows }, (_, index) => ({
 				shardId: `shard-${index}`,
 				agent: "reviewer",
@@ -558,10 +573,7 @@ describe("parallel command handler", () => {
 		expect(harness.complete("resume run-")).toEqual([]);
 		harness.coordinator.statusResult = [];
 		await harness.command("status");
-		expect(harness.complete("resume run-")?.map(item => item.value)).toEqual([
-			"resume run-alpha",
-			"resume run-beta",
-		]);
+		expect(harness.complete("resume run-")?.map(item => item.value)).toEqual(["resume run-alpha", "resume run-beta"]);
 	});
 });
 
