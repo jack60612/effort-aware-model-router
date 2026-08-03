@@ -581,3 +581,68 @@ describe("parallel coordinator recovery and status", () => {
 		await expect(harness.coordinator.status("nope")).rejects.toThrow('unknown run "nope"');
 	});
 });
+
+describe("parallel coordinator guards", () => {
+	it("integrate rejects a cancelled run, even one that was ready to integrate", async () => {
+		const harness = makeHarness();
+		const plan = makePlan([{ id: "a" }]);
+		const created = await harness.coordinator.createRun(plan);
+		const resumed = await harness.coordinator.resume(created.run.runId);
+		expect(resumed.run.status).toBe("ready_to_integrate");
+
+		const cancelled = await harness.coordinator.cancel(created.run.runId);
+		expect(cancelled.run.status).toBe("cancelled");
+
+		await expect(harness.coordinator.integrate(created.run.runId)).rejects.toThrow("run is cancelled");
+		expect(harness.events.some(event => event.startsWith("merge:"))).toBe(false);
+	});
+
+	it("review() before any shard has run preserves the planned status and dispatches nothing", async () => {
+		const harness = makeHarness();
+		const plan = makePlan([{ id: "a", review: { agent: "reviewer", required: true } }]);
+		const created = await harness.coordinator.createRun(plan);
+		const snapshot = await harness.coordinator.review(created.run.runId);
+		expect(snapshot.run.status).toBe("planned");
+		expect(snapshot.reviews[0]?.status).toBe("pending");
+		expect(harness.requests).toHaveLength(0);
+	});
+
+	it("wait() blocks on every concurrent in-flight operation, not only the latest", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let started: (() => void) | null = null;
+		const startedPromise = new Promise<void>(resolve => {
+			started = resolve;
+		});
+		const harness = makeHarness({
+			runSubagent: async request => {
+				started?.();
+				await gate;
+				return okResult(`done:${request.id}`);
+			},
+		});
+		const plan = makePlan([{ id: "a" }]);
+		const created = await harness.coordinator.createRun(plan);
+		const resumePromise = harness.coordinator.resume(created.run.runId);
+		await startedPromise;
+
+		// A quick no-op review() registers and settles while resume is in flight.
+		await harness.coordinator.review(created.run.runId);
+
+		let waited = false;
+		const waitPromise = harness.coordinator.wait(created.run.runId).then(snapshot => {
+			waited = true;
+			return snapshot;
+		});
+		for (let tick = 0; tick < 10; tick += 1) await Promise.resolve();
+		expect(waited).toBe(false);
+
+		release();
+		const snapshot = await waitPromise;
+		expect(waited).toBe(true);
+		expect(snapshot.run.status).toBe("ready_to_integrate");
+		await resumePromise;
+	});
+});

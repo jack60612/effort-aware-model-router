@@ -1,12 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	type AgentDefinition,
-	discoverAgents,
-	isReadOnlyAgent,
-	type SingleResult,
-} from "@oh-my-pi/pi-coding-agent/task";
+import { type AgentDefinition, isReadOnlyAgent, type SingleResult } from "@oh-my-pi/pi-coding-agent/task";
 import {
 	captureBaseline,
 	cleanupIsolation,
@@ -230,7 +225,7 @@ export class ParallelCoordinator {
 	private readonly createReviewWorktree: (repoRoot: string, branchName: string, worktreeId: string) => Promise<string>;
 	private readonly removeReviewWorktree: (repoRoot: string, worktreeDir: string) => Promise<void>;
 	private readonly controllers = new Map<string, Set<AbortController>>();
-	private readonly active = new Map<string, Promise<unknown>>();
+	private readonly active = new Map<string, Set<Promise<unknown>>>();
 
 	constructor(host: ParallelCoordinatorHost, dependencies: ParallelCoordinatorDependencies) {
 		this.host = host;
@@ -370,21 +365,26 @@ export class ParallelCoordinator {
 		return this.requireRun(runId);
 	}
 
-	/** Resolve once in-flight work for the run settles; never busy-spins. */
+	/** Resolve once every in-flight operation for the run settles; never busy-spins. */
 	async wait(runId: string): Promise<ParallelRunSnapshot> {
-		let pending = this.active.get(runId);
-		while (pending !== undefined) {
-			await pending.catch(() => undefined);
-			const next = this.active.get(runId);
-			pending = next === pending ? undefined : next;
+		for (;;) {
+			const pending = this.active.get(runId);
+			if (pending === undefined || pending.size === 0) break;
+			await Promise.allSettled([...pending]);
 		}
 		return this.requireRun(runId);
 	}
 
 	private trackActive(runId: string, promise: Promise<unknown>): void {
-		this.active.set(runId, promise);
+		let set = this.active.get(runId);
+		if (set === undefined) {
+			set = new Set();
+			this.active.set(runId, set);
+		}
+		set.add(promise);
 		void promise.catch(() => undefined).finally(() => {
-			if (this.active.get(runId) === promise) this.active.delete(runId);
+			set.delete(promise);
+			if (set.size === 0 && this.active.get(runId) === set) this.active.delete(runId);
 		});
 	}
 
@@ -648,6 +648,7 @@ export class ParallelCoordinator {
 
 		const controller = this.registerController(runId);
 		try {
+			let anyReviewRan = false;
 			for (const shard of plan.shards) {
 				if (controller.signal.aborted) break;
 				if (shard.review === undefined) continue;
@@ -656,6 +657,7 @@ export class ParallelCoordinator {
 				const record = shardsById.get(shard.id);
 				const shardStatus = record?.status;
 				if (shardStatus !== "review_pending" && shardStatus !== "completed") continue;
+				anyReviewRan = true;
 				await this.runReview(
 					runId,
 					plan,
@@ -666,7 +668,8 @@ export class ParallelCoordinator {
 					controller.signal,
 				);
 			}
-			if (!controller.signal.aborted) {
+			// A no-op retry pass must not disturb the run status (e.g. planned).
+			if (anyReviewRan && !controller.signal.aborted) {
 				const latest = this.requireRun(runId);
 				this.store.updateRun(runId, { status: computeRunOutcome(plan, latest) });
 			}
@@ -679,6 +682,9 @@ export class ParallelCoordinator {
 	private async integrateInner(runId: string): Promise<ParallelRunSnapshot> {
 		const stored = this.requireRun(runId);
 		if (stored.run.status === "integrated") throw coordinatorError(`run "${runId}" is already integrated`);
+		if (stored.run.status === "cancelled") {
+			throw coordinatorError(`cannot integrate run "${runId}": run is cancelled`);
+		}
 		const plan = stored.run.plan;
 
 		const shardsById = new Map(stored.shards.map(shard => [shard.shardId, shard]));
