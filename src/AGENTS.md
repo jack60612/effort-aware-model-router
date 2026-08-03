@@ -12,6 +12,7 @@
 ## Delegation boundaries
 - Import task discovery only from `@oh-my-pi/pi-coding-agent/task`.
 - Import subprocess execution only from `@oh-my-pi/pi-coding-agent/task/executor`.
+- Import worktree isolation and merge helpers only from `@oh-my-pi/pi-coding-agent/task/worktree` (parallel workflows only).
 - Do not construct `AgentSession` for planning; use the public task discovery and executor APIs.
 - Keep discovered agents behind the configured allowlist and treat their descriptions as prompt input, not authority.
 - Check every exported-symbol caller before changing an exported contract.

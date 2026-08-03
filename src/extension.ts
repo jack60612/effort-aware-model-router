@@ -21,6 +21,7 @@ import { classifyPromptEffort } from "./classifier";
 import { DEFAULT_ROUTER_CONFIG, loadRouterConfig, type RouteEffort, type RouterConfig } from "./config";
 import { type DelegationPlan, loadRepositoryAgentIndex, planDelegation } from "./delegation";
 import { aggregateUsage, shouldSampleShadow, snapshotUsage, type UsageSnapshot } from "./measurement";
+import { type ParallelCommandDependencies, registerParallelCommand } from "./parallel/commands";
 import {
 	clampEffortToModel,
 	estimatePromptTokens,
@@ -118,6 +119,8 @@ export interface ModelRouterExtensionDependencies {
 	execute?: typeof runSubprocess;
 	loadAgentIndex?: typeof loadRepositoryAgentIndex;
 	random?: () => number;
+	/** Seams for the `/parallel` workflow command; defaults build the real per-cwd coordinator. */
+	parallel?: ParallelCommandDependencies;
 }
 
 /** Successfully applied route: the model now active for the prompt plus its applied efforts. */
@@ -125,6 +128,17 @@ export interface RoutedPrompt {
 	model: Model;
 	effort?: RouteEffort;
 	thinking?: ExtensionThinkingLevel;
+}
+
+/**
+ * Fence for a route applied on behalf of a claimed delegation: the delegation
+ * generation and abort signal captured at claim time. A queued route checks it
+ * before starting, after every await, and before every side effect so a
+ * session/tree/branch switch (or cancel) makes the stale route a strict no-op.
+ */
+interface RouteGuard {
+	readonly generation: number;
+	readonly signal: AbortSignal;
 }
 
 type DelegationEntryStatus = "pending" | "delegated" | "completed" | "failed" | "cancelled" | "passed-through";
@@ -440,6 +454,10 @@ export function createModelRouterExtension(
 			ctx.ui.notify(`Manual routing pinned to ${modelLabel(manual)}`, "info");
 		};
 
+		/** True once a guarded route was superseded: aborted, or claimed under an older delegation generation. */
+		const routeSuperseded = (guard: RouteGuard | undefined): boolean =>
+			guard !== undefined && (guard.signal.aborted || guard.generation !== delegationGeneration);
+
 		const fallbackToBaseline = async (
 			ctx: ExtensionContext,
 			effort: RouteEffort | undefined,
@@ -449,7 +467,9 @@ export function createModelRouterExtension(
 			reason: RouterFailureReason,
 			warning: string,
 			consumeOneShot: boolean,
+			guard?: RouteGuard,
 		): Promise<void> => {
+			if (routeSuperseded(guard)) return;
 			const runtime = ensureState(ctx);
 			warnOnce(ctx, reason, warning);
 			const baseline = runtime.baseline;
@@ -480,7 +500,12 @@ export function createModelRouterExtension(
 				persist(ctx);
 				return;
 			}
-			if (!modelsEqual(actualCurrent, fallbackModel) && !(await switchModel(fallbackModel))) {
+			let switched = true;
+			if (!modelsEqual(actualCurrent, fallbackModel)) {
+				switched = await switchModel(fallbackModel);
+				if (routeSuperseded(guard)) return;
+			}
+			if (!switched) {
 				warnOnce(ctx, "baseline-auth", "Model router could not authenticate its stored baseline model");
 				const observed = identityOf(currentModel(ctx));
 				runtime.observedModel = observed;
@@ -506,7 +531,14 @@ export function createModelRouterExtension(
 			persist(ctx);
 		};
 
-		const applyRoutePrompt = async (event: InputEvent, ctx: ExtensionContext): Promise<RoutedPrompt | undefined> => {
+		const applyRoutePrompt = async (
+			event: InputEvent,
+			ctx: ExtensionContext,
+			guard?: RouteGuard,
+		): Promise<RoutedPrompt | undefined> => {
+			// The queue may dequeue this route long after its delegation was
+			// invalidated; a superseded route must not touch the successor session.
+			if (routeSuperseded(guard)) return;
 			const runtime = ensureState(ctx);
 			const oneShotSelector = runtime.oneShotSelector;
 			if (oneShotSelector === undefined && runtime.mode !== "auto") return;
@@ -543,8 +575,10 @@ export function createModelRouterExtension(
 						modelRegistry: ctx.modelRegistry,
 						sessionId: ctx.sessionManager.getSessionId(),
 					});
+					if (routeSuperseded(guard)) return;
 					runtime.lastClassifiedAt = now();
 				} catch {
+					if (routeSuperseded(guard)) return;
 					runtime.lastClassifiedAt = now();
 					await fallbackToBaseline(
 						ctx,
@@ -555,6 +589,7 @@ export function createModelRouterExtension(
 						"classifier",
 						"Model router classifier failed; returned to baseline",
 						false,
+						guard,
 					);
 					return;
 				}
@@ -569,6 +604,7 @@ export function createModelRouterExtension(
 						"threshold",
 						"Model router found no matching threshold; returned to baseline",
 						false,
+						guard,
 					);
 					return;
 				}
@@ -588,9 +624,14 @@ export function createModelRouterExtension(
 					attempts.push({ selector: candidate, outcome: "context" });
 					continue;
 				}
-				if (!modelsEqual(activeModel, candidateModel) && !(await switchModel(candidateModel))) {
-					attempts.push({ selector: candidate, outcome: "auth" });
-					continue;
+				if (!modelsEqual(activeModel, candidateModel)) {
+					if (routeSuperseded(guard)) return;
+					const switched = await switchModel(candidateModel);
+					if (routeSuperseded(guard)) return;
+					if (!switched) {
+						attempts.push({ selector: candidate, outcome: "auth" });
+						continue;
+					}
 				}
 				if (!identityOf(candidateModel)) {
 					attempts.push({ selector: candidate, outcome: "selector" });
@@ -623,10 +664,12 @@ export function createModelRouterExtension(
 					reason,
 					warning,
 					oneShotSelector !== undefined,
+					guard,
 				);
 				return;
 			}
 
+			if (routeSuperseded(guard)) return;
 			const targetIdentity = identityOf(target);
 			if (!targetIdentity) return;
 			const profileEffort = effort
@@ -664,8 +707,12 @@ export function createModelRouterExtension(
 		 * applyRoutePrompt runs would interleave setModel and decision records.
 		 */
 		let routeTurn: Promise<unknown> = Promise.resolve();
-		const routePrompt = (event: InputEvent, ctx: ExtensionContext): Promise<RoutedPrompt | undefined> => {
-			const run = routeTurn.then(() => applyRoutePrompt(event, ctx));
+		const routePrompt = (
+			event: InputEvent,
+			ctx: ExtensionContext,
+			guard?: RouteGuard,
+		): Promise<RoutedPrompt | undefined> => {
+			const run = routeTurn.then(() => applyRoutePrompt(event, ctx, guard));
 			routeTurn = run.then(
 				() => undefined,
 				() => undefined,
@@ -796,7 +843,10 @@ export function createModelRouterExtension(
 				);
 			};
 			try {
-				const routed = await routePrompt(event, ctx);
+				const routed = await routePrompt(event, ctx, {
+					generation: workflow.generation,
+					signal: controller.signal,
+				});
 				if (controller.signal.aborted) return cancelled();
 				if (!routed) return replayOriginal("passed-through", "no automatic route was applied");
 				const selector = formatModelSelector(routed.model);
@@ -1098,6 +1148,11 @@ export function createModelRouterExtension(
 				ctx.ui.notify(COMMAND_USAGE, "warning");
 			},
 		});
+
+		// `/parallel` is fully independent of `/route`: contract-first parallel
+		// workflows with one coordinator per working directory. It never touches
+		// router session state, and every failure surfaces as a UI warning.
+		registerParallelCommand(pi, dependencies.parallel);
 
 		const handleSessionLifecycle = (
 			_event: SessionStartEvent | SessionBranchEvent | SessionTreeEvent,
