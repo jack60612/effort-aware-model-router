@@ -830,6 +830,24 @@ describe("model router extension", () => {
 		expect(harness.thinkingCalls).toEqual(["high", "inherit"]);
 		expect(harness.thinkingLevel).toBe("inherit");
 	});
+	it("recaptures thinking after an automatic candidate authentication failure", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high", "high"];
+		harness.setModelResults = [false, true];
+		await harness.lifecycle();
+		await harness.input("first high effort attempt");
+		expect(harness.current).toBe(base);
+		expect(harness.thinkingCalls).toEqual([]);
+
+		harness.thinkingLevel = "low";
+		await harness.input("second high effort attempt");
+		expect(harness.current).toBe(slow);
+
+		await harness.agentEnd(false);
+
+		expect(harness.thinkingCalls).toEqual(["high", "low"]);
+		expect(harness.thinkingLevel).toBe("low");
+	});
 
 	it("clamps unsupported high effort downward on a reasoning model", async () => {
 		const harness = new Harness();

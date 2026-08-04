@@ -376,6 +376,11 @@ export function createModelRouterExtension(
 			automaticBaselineThinkingCaptured = false;
 			automaticBaselineThinkingLevel = undefined;
 		};
+		const discardAutomaticThinkingCapture = (): void => {
+			if (automaticRouteToken !== undefined || automaticThinkingApplied) return;
+			automaticBaselineThinkingCaptured = false;
+			automaticBaselineThinkingLevel = undefined;
+		};
 		const invalidateAutomaticRoute = (): void => {
 			resetAutomaticThinking();
 			automaticRouteGeneration = undefined;
@@ -626,6 +631,7 @@ export function createModelRouterExtension(
 			guard?: RouteGuard,
 		): Promise<void> => {
 			if (routeSuperseded(guard)) return;
+			discardAutomaticThinkingCapture();
 			const runtime = ensureState(ctx);
 			warnOnce(ctx, reason, warning);
 			const baseline = runtime.baseline;
