@@ -622,7 +622,6 @@ describe("model router extension", () => {
 		const pending = Promise.withResolvers<boolean>();
 		harness.setModelResults = [() => pending.promise];
 		const entriesBeforeRestore = harness.entries.length;
-		const restore = harness.agentEnd(false);
 		await harness.settle(() => harness.setModelCalls.length === 2);
 
 		const lifecycle = harness.lifecycle("session_switch");

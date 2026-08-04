@@ -326,7 +326,7 @@ export function createModelRouterExtension(
 		let delegationGeneration = 0;
 		let automaticRouteGeneration: number | undefined;
 		/** FIFO turn fence because public agent_end has no turn/session identifier. */
-		let automaticMainTurns: AutomaticMainTurn[] = [];
+		const automaticMainTurns: AutomaticMainTurn[] = [];
 		/** Serializes router-owned baseline restores with later router controls and inputs. */
 		let automaticRestorePromise: Promise<void> = Promise.resolve();
 		let shadowRunSequence = 0;
