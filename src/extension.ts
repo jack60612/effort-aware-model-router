@@ -370,11 +370,17 @@ export function createModelRouterExtension(
 				return false;
 			}
 		};
-		const resetAutomaticThinking = (): void => {
-			if (automaticThinkingApplied) pi.setThinkingLevel(automaticBaselineThinkingLevel ?? "inherit");
+		const clearAutomaticThinkingOwnership = (): void => {
 			automaticThinkingApplied = false;
 			automaticBaselineThinkingCaptured = false;
 			automaticBaselineThinkingLevel = undefined;
+		};
+		const resetAutomaticThinking = (): void => {
+			if (automaticThinkingApplied || automaticBaselineThinkingCaptured) {
+				const baseline = automaticBaselineThinkingLevel ?? "inherit";
+				if (pi.getThinkingLevel() !== baseline) pi.setThinkingLevel(baseline);
+			}
+			clearAutomaticThinkingOwnership();
 		};
 		const discardAutomaticThinkingCapture = (): void => {
 			if (automaticRouteToken !== undefined || automaticThinkingApplied) return;
@@ -386,15 +392,31 @@ export function createModelRouterExtension(
 			automaticRouteGeneration = undefined;
 			automaticRouteToken = undefined;
 		};
+		const discardAutomaticRoute = (): void => {
+			clearAutomaticThinkingOwnership();
+			automaticRouteGeneration = undefined;
+			automaticRouteToken = undefined;
+		};
 		const markAutomaticMainTurnsStale = (settled = false): void => {
 			for (const turn of automaticMainTurns) {
 				turn.stale = true;
 				if (settled) turn.settled = true;
 			}
 		};
-		const queueAutomaticMainTurn = (generation: number, routeToken?: number): void => {
+		const queueAutomaticMainTurn = (generation: number, routeToken?: number, replaceRouteToken?: number): void => {
+			const replaceIndex =
+				replaceRouteToken === undefined
+					? -1
+					: automaticMainTurns.findIndex(
+							turn => !turn.stale && !turn.settled && turn.routeToken === replaceRouteToken,
+						);
 			markAutomaticMainTurnsStale();
-			automaticMainTurns.push({ generation, routeToken, stale: false, settled: false });
+			const nextTurn: AutomaticMainTurn = { generation, routeToken, stale: false, settled: false };
+			if (replaceIndex >= 0) {
+				automaticMainTurns[replaceIndex] = nextTurn;
+			} else {
+				automaticMainTurns.push(nextTurn);
+			}
 		};
 		const waitForAutomaticRestore = async (): Promise<void> => {
 			await automaticRestorePromise;
@@ -720,7 +742,7 @@ export function createModelRouterExtension(
 					runtime.lastAutoModel ?? undefined,
 				);
 				if (activeIdentity && changedFromObserved && differsFromLastAutomatic) {
-					invalidateAutomaticRoute();
+					discardAutomaticRoute();
 					runtime.mode = "manual";
 					runtime.baseline = activeIdentity;
 					runtime.observedModel = activeIdentity;
@@ -855,7 +877,11 @@ export function createModelRouterExtension(
 				automaticRouteToken = appliedAutomaticRouteToken;
 				automaticRouteGeneration = delegationGeneration;
 				if (guard?.automaticMainTurn === true) {
-					queueAutomaticMainTurn(delegationGeneration, appliedAutomaticRouteToken);
+					queueAutomaticMainTurn(
+						delegationGeneration,
+						appliedAutomaticRouteToken,
+						guard.inheritedAutomaticRouteToken,
+					);
 				}
 			}
 			const profileEffort = effort
@@ -865,6 +891,8 @@ export function createModelRouterExtension(
 			if (thinking) {
 				if (oneShotSelector === undefined) automaticThinkingApplied = true;
 				pi.setThinkingLevel(THINKING_LEVEL_BY_EFFORT[thinking]);
+			} else if (oneShotSelector === undefined && automaticThinkingApplied) {
+				if (pi.getThinkingLevel() !== "inherit") pi.setThinkingLevel("inherit");
 			}
 			runtime.observedModel = targetIdentity;
 			runtime.lastAutoModel = targetIdentity;

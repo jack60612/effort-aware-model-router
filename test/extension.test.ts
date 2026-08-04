@@ -62,6 +62,7 @@ const base = model("base", { efforts: ["low", "medium", "high"] });
 const smol = model("smol", { efforts: ["minimal", "low", "medium"] });
 const slow = model("slow", { efforts: ["low", "high", "xhigh"] });
 const plain = model("plain", { reasoning: false });
+const metadataLess = model("metadata-less", { reasoning: true });
 
 function routerConfig(overrides: Partial<RouterConfig> = {}): RouterConfig {
 	return {
@@ -266,10 +267,12 @@ class Harness {
 		["@smol", smol],
 		["@slow", slow],
 		["@plain", plain],
+		["@metadata-less", metadataLess],
 		["mock/base", base],
 		["mock/smol", smol],
 		["mock/slow", slow],
 		["mock/plain", plain],
+		["mock/metadata-less", metadataLess],
 	]);
 
 	readonly api: ExtensionAPI;
@@ -866,6 +869,29 @@ describe("model router extension", () => {
 		await harness.input("do not classify me");
 		expect(harness.classifierPrompts).toEqual([]);
 		expect(harness.state()).toMatchObject({ mode: "manual", baseline: { provider: "mock", id: "slow" } });
+	});
+	it("preserves the thinking level selected by an external model picker", async () => {
+		const harness = new Harness();
+		harness.config = routerConfig({
+			thresholds: { high: ["@slow"] },
+			thinkingProfiles: { "mock/slow": { high: "high" } },
+		});
+		harness.thinkingLevel = "low";
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("hard routed work");
+		expect(harness.thinkingLevel).toBe("high");
+
+		harness.current = smol;
+		harness.thinkingLevel = "medium";
+		await harness.input("manual follow-up");
+
+		expect(harness.state()).toMatchObject({
+			mode: "manual",
+			baseline: { provider: "mock", id: "smol" },
+		});
+		expect(harness.thinkingCalls).toEqual(["high"]);
+		expect(harness.thinkingLevel).toBe("medium");
 	});
 
 	it("makes explicit manual mode reliable even when pinning the last automatic model", async () => {
@@ -1502,6 +1528,40 @@ describe("model router delegation", () => {
 		const harness = await successfulDelegation();
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
 		expect(harness.current).toBe(base);
+	});
+	it("restores after a detached route is inherited by a successor main input", async () => {
+		const harness = new Harness();
+		harness.config = delegationConfig(
+			{},
+			{
+				thresholds: { low: ["@metadata-less"], high: ["@slow"] },
+				thinkingProfiles: { "mock/slow": { high: "high" } },
+			},
+		);
+		harness.thinkingLevel = "low";
+		await harness.lifecycle();
+		harness.classifications = ["high", "low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		const deferredResult = Promise.withResolvers<SingleResult>();
+		harness.executeResults = [() => deferredResult.promise];
+
+		expect(await harness.input("original delegated request")).toEqual({ handled: true });
+		await harness.settle(() => harness.executeCalls.length === 1);
+		expect(harness.current).toBe(slow);
+		expect(harness.thinkingCalls).toEqual(["high"]);
+
+		await harness.input("successor main request");
+		expect(harness.current).toBe(metadataLess);
+		expect(harness.thinkingCalls).toEqual(["high", "inherit"]);
+
+		deferredResult.resolve(singleResult({ output: "child output text" }));
+		await harness.settle(() => harness.customMessages.length === 1);
+		await harness.agentEnd(false);
+
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "metadata-less", "base"]);
+		expect(harness.current).toBe(base);
+		expect(harness.thinkingCalls).toEqual(["high", "inherit", "low"]);
+		expect(harness.thinkingLevel).toBe("low");
 	});
 
 	it("renders success visibly without a main turn or replay", async () => {
