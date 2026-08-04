@@ -8,6 +8,9 @@ import type {
 	InputEvent,
 	InputEventResult,
 	MessageEndEvent,
+	SessionBeforeBranchEvent,
+	SessionBeforeSwitchEvent,
+	SessionBeforeTreeEvent,
 	SessionBranchEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
@@ -368,8 +371,11 @@ export function createModelRouterExtension(
 			automaticRouteGeneration = undefined;
 			automaticRouteToken = undefined;
 		};
-		const markAutomaticMainTurnsStale = (): void => {
-			for (const turn of automaticMainTurns) turn.stale = true;
+		const markAutomaticMainTurnsStale = (settled = false): void => {
+			for (const turn of automaticMainTurns) {
+				turn.stale = true;
+				if (settled) turn.settled = true;
+			}
 		};
 		const queueAutomaticMainTurn = (generation: number, routeToken?: number): void => {
 			markAutomaticMainTurnsStale();
@@ -892,7 +898,7 @@ export function createModelRouterExtension(
 		 */
 		const invalidateDelegation = (reason: string): void => {
 			delegationGeneration += 1;
-			markAutomaticMainTurnsStale();
+			markAutomaticMainTurnsStale(true);
 			invalidateAutomaticRoute();
 			const stale = activeDelegation;
 			if (!stale) return;
@@ -1365,6 +1371,16 @@ export function createModelRouterExtension(
 			await waitForAutomaticRestore();
 			await rehydrate(ctx, true);
 		};
+		const handleSessionBeforeLifecycle = async (
+			_event: SessionBeforeSwitchEvent | SessionBeforeBranchEvent | SessionBeforeTreeEvent,
+		): Promise<void> => {
+			invalidateDelegation("model-router: delegation invalidated before session lifecycle");
+			resetMeasurement("model-router: shadow cancelled before session lifecycle");
+			await waitForAutomaticRestore();
+		};
+		pi.on("session_before_switch", handleSessionBeforeLifecycle);
+		pi.on("session_before_branch", handleSessionBeforeLifecycle);
+		pi.on("session_before_tree", handleSessionBeforeLifecycle);
 		pi.on("session_start", handleSessionLifecycle);
 		pi.on("session_switch", handleSessionSwitch);
 		pi.on("session_branch", handleSessionLifecycle);

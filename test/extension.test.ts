@@ -225,6 +225,7 @@ class Harness {
 	branchEntries: TestEntry[] | undefined;
 	readonly notifications: Array<{ message: string; type: string | undefined }> = [];
 	readonly statuses: Array<string | undefined> = [];
+	readonly lifecycleTransitions: string[] = [];
 	readonly setModelCalls: Model[] = [];
 	readonly thinkingCalls: string[] = [];
 	readonly resolvedSelectors: string[] = [];
@@ -418,6 +419,12 @@ class Harness {
 	}
 
 	async lifecycle(name = "session_start"): Promise<void> {
+		const beforeName =
+			name === "session_switch" || name === "session_branch" || name === "session_tree"
+				? `session_before_${name.slice("session_".length)}`
+				: undefined;
+		await this.handlers.get(beforeName ?? "")?.({ type: beforeName }, this.ctx);
+		this.lifecycleTransitions.push(name);
 		await this.handlers.get(name)?.({ type: name }, this.ctx);
 	}
 
@@ -491,6 +498,9 @@ describe("model router extension", () => {
 			"agent_end",
 			"input",
 			"message_end",
+			"session_before_branch",
+			"session_before_switch",
+			"session_before_tree",
 			"session_branch",
 			"session_shutdown",
 			"session_start",
@@ -635,6 +645,41 @@ describe("model router extension", () => {
 			lastAutoModel: { provider: "mock", id: "slow" },
 		});
 	});
+	it("blocks successor lifecycle mutation until an in-flight restore settles", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		const pending = Promise.withResolvers<boolean>();
+		harness.setModelResults = [() => pending.promise];
+		const restore = harness.agentEnd(false);
+		await harness.settle(() => harness.setModelCalls.length === 2);
+
+		const lifecycle = harness.lifecycle("session_switch");
+		await Promise.resolve();
+		expect(harness.lifecycleTransitions).toEqual(["session_start"]);
+
+		pending.resolve(true);
+		await restore;
+		await lifecycle;
+		expect(harness.lifecycleTransitions).toEqual(["session_start", "session_switch"]);
+		expect(harness.current).toBe(base);
+	});
+
+	it("restores a successor route when the invalidated predecessor never emits agent_end", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high", "high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		await harness.lifecycle("session_switch");
+		await harness.input("successor cross-system race");
+		expect(harness.current).toBe(slow);
+
+		await harness.agentEnd(false);
+
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
+		expect(harness.current).toBe(base);
+	});
 
 	it("fences an in-flight baseline restore after an external model change", async () => {
 		const harness = new Harness();
@@ -691,7 +736,7 @@ describe("model router extension", () => {
 		expect(harness.current).toBe(base);
 	});
 
-	it("fences a delayed old terminal event from a successor automatic route", async () => {
+	it("settles a lifecycle orphan before the successor terminal event", async () => {
 		const harness = new Harness();
 		harness.classifications = ["high", "high"];
 		await harness.lifecycle();
@@ -702,14 +747,14 @@ describe("model router extension", () => {
 		await harness.input("successor cross-system race");
 		expect(harness.current).toBe(slow);
 
-		const callsBeforeTerminalEvents = harness.setModelCalls.length;
-		await harness.agentEnd(false);
-		expect(harness.setModelCalls.slice(callsBeforeTerminalEvents).map(model => model.id)).not.toContain("base");
-		expect(harness.current).toBe(slow);
-
+		// AgentEndEvent has no turn/session identity, so this event must be
+		// attributed to the successor once the predecessor is known to be gone.
 		await harness.agentEnd(false);
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
 		expect(harness.current).toBe(base);
+
+		await harness.agentEnd(false);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
 	});
 	it("settles the prior automatic route before a terminal event reaches the extension", async () => {
 		const harness = new Harness();
