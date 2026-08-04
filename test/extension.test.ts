@@ -560,6 +560,69 @@ describe("model router extension", () => {
 		expect(harness.statuses.at(-1)).toContain("baseline mock/base");
 	});
 
+	it("returns to the cheap baseline after a terminal automatic turn", async () => {
+		const harness = new Harness();
+		harness.config = routerConfig({ classifierMinPromptChars: 8 });
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
+
+		await harness.agentEnd(false);
+
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
+		expect(harness.current).toBe(base);
+		expect(harness.state()).toMatchObject({
+			observedModel: { provider: "mock", id: "base" },
+			lastAutoModel: { provider: "mock", id: "base" },
+		});
+		const classified = harness.classifierPrompts.length;
+		await harness.input("ok");
+		expect(harness.current).toBe(base);
+		expect(harness.classifierPrompts).toHaveLength(classified);
+	});
+
+	it("keeps the automatic target while the agent turn will continue", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+
+		await harness.agentEnd(true);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
+		expect(harness.current).toBe(slow);
+
+		await harness.agentEnd(false);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
+		expect(harness.current).toBe(base);
+	});
+
+	it("does not overwrite a manual model choice before terminal automatic reset", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		harness.current = smol;
+
+		await harness.agentEnd(false);
+
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
+		expect(harness.current).toBe(smol);
+	});
+
+	it("does not restore a stale automatic target after a successor lifecycle", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
+
+		await harness.lifecycle("session_switch");
+		const callsBeforeTerminalEvent = harness.setModelCalls.length;
+		await harness.agentEnd(false);
+		expect(harness.setModelCalls.slice(callsBeforeTerminalEvent).map(model => model.id)).not.toContain("base");
+	});
+
 	it("avoids same-model resets, clamps effort, and does not mutate thinking for plain targets", async () => {
 		const harness = new Harness();
 		harness.current = smol;
@@ -1178,6 +1241,13 @@ describe("model router delegation", () => {
 		});
 		expect(passedThrough.executeCalls).toEqual([]);
 		expect(passedThrough.delegationEntries().at(-1)).toMatchObject({ status: "passed-through" });
+		expect(passedThrough.setModelCalls.map(model => model.id)).toEqual(["smol"]);
+		expect(passedThrough.current).toBe(smol);
+
+		await passedThrough.agentEnd(false);
+
+		expect(passedThrough.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
+		expect(passedThrough.current).toBe(base);
 	});
 
 	it("executes a valid plan through the public executor contract", async () => {
@@ -1195,6 +1265,12 @@ describe("model router delegation", () => {
 		expect(typeof call?.index).toBe("number");
 		expect(call?.signal).toBeInstanceOf(AbortSignal);
 		expect(call?.keepAlive).toBe(false);
+	});
+
+	it("restores the baseline after a detached child completes", async () => {
+		const harness = await successfulDelegation();
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
+		expect(harness.current).toBe(base);
 	});
 
 	it("renders success visibly without a main turn or replay", async () => {
@@ -1231,6 +1307,8 @@ describe("model router delegation", () => {
 		expect(harness.userMessages[0]?.content).toContain("the original standalone request");
 		expect(harness.userMessages[0]?.content).toContain("side effects");
 		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
+		expect(harness.current).toBe(base);
 	});
 
 	it("treats a throwing child as a guarded failure", async () => {
