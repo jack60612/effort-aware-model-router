@@ -315,6 +315,7 @@ export function createModelRouterExtension(
 		let delegationRunSequence = 0;
 		/** Bumped on session start/switch/branch/tree so an in-flight workflow can never write into a successor session. */
 		let delegationGeneration = 0;
+		let automaticRouteGeneration: number | undefined;
 		let shadowRunSequence = 0;
 		let shadowController: AbortController | undefined;
 		/** Bumped on every session reset so a stale detached shadow can never append into a successor session. */
@@ -396,6 +397,7 @@ export function createModelRouterExtension(
 				ctx.ui.setStatus(STATUS_KEY, routerStatus(runtime));
 				return;
 			}
+			automaticRouteGeneration = undefined;
 			runtime.mode = "auto";
 			runtime.baseline = current;
 			runtime.observedModel = current;
@@ -407,6 +409,7 @@ export function createModelRouterExtension(
 
 		const transitionOff = (ctx: ExtensionContext): void => {
 			const runtime = ensureState(ctx);
+			automaticRouteGeneration = undefined;
 			if (runtime.mode === "off") return;
 			runtime.mode = "off";
 			runtime.observedModel = identityOf(currentModel(ctx));
@@ -416,6 +419,7 @@ export function createModelRouterExtension(
 		};
 
 		const transitionManual = async (ctx: ExtensionContext, selector: string | undefined): Promise<void> => {
+			automaticRouteGeneration = undefined;
 			const runtime = ensureState(ctx);
 			let selected = currentModel(ctx);
 			if (selector) {
@@ -452,6 +456,41 @@ export function createModelRouterExtension(
 			runtime.lastDecision = null;
 			persist(ctx);
 			ctx.ui.notify(`Manual routing pinned to ${modelLabel(manual)}`, "info");
+		};
+		const restoreAutomaticBaseline = async (ctx: ExtensionContext, generation: number): Promise<void> => {
+			if (automaticRouteGeneration !== generation) return;
+			const runtime = ensureState(ctx);
+			if (
+				runtime.mode !== "auto" ||
+				runtime.baseline === null ||
+				runtime.lastAutoModel === null
+			) {
+				return;
+			}
+			const activeModel = currentModel(ctx);
+			const lastAutomaticModel = ctx.models.resolve(formatModelSelector(runtime.lastAutoModel));
+			if (!modelsEqual(activeModel, lastAutomaticModel)) return;
+			const baselineModel = ctx.models.resolve(formatModelSelector(runtime.baseline));
+			if (!baselineModel) {
+				warnOnce(ctx, "baseline", "Model router could not resolve its stored baseline model");
+				persist(ctx);
+				return;
+			}
+			const baselineIdentity = identityOf(baselineModel);
+			if (modelsEqual(activeModel, baselineModel)) {
+				runtime.observedModel = baselineIdentity;
+				runtime.lastAutoModel = baselineIdentity;
+				persist(ctx);
+				return;
+			}
+			if (!(await switchModel(baselineModel))) {
+				warnOnce(ctx, "baseline-auth", "Model router could not authenticate its stored baseline model");
+				persist(ctx);
+				return;
+			}
+			runtime.observedModel = baselineIdentity;
+			runtime.lastAutoModel = baselineIdentity;
+			persist(ctx);
 		};
 
 		/** True once a guarded route was superseded: aborted, or claimed under an older delegation generation. */
@@ -541,6 +580,7 @@ export function createModelRouterExtension(
 			if (routeSuperseded(guard)) return;
 			const runtime = ensureState(ctx);
 			const oneShotSelector = runtime.oneShotSelector;
+			if (oneShotSelector !== undefined) automaticRouteGeneration = undefined;
 			if (oneShotSelector === undefined && runtime.mode !== "auto") return;
 			const activeModel = currentModel(ctx);
 			const activeIdentity = identityOf(activeModel);
@@ -551,6 +591,7 @@ export function createModelRouterExtension(
 					runtime.lastAutoModel ?? undefined,
 				);
 				if (activeIdentity && changedFromObserved && differsFromLastAutomatic) {
+					automaticRouteGeneration = undefined;
 					runtime.mode = "manual";
 					runtime.baseline = activeIdentity;
 					runtime.observedModel = activeIdentity;
@@ -672,6 +713,7 @@ export function createModelRouterExtension(
 			if (routeSuperseded(guard)) return;
 			const targetIdentity = identityOf(target);
 			if (!targetIdentity) return;
+			if (oneShotSelector === undefined) automaticRouteGeneration = delegationGeneration;
 			const profileEffort = effort
 				? resolveThinkingEffort(effort, config.thinkingProfiles[formatModelSelector(target)])
 				: undefined;
@@ -735,6 +777,7 @@ export function createModelRouterExtension(
 		 */
 		const invalidateDelegation = (reason: string): void => {
 			delegationGeneration += 1;
+			automaticRouteGeneration = undefined;
 			const stale = activeDelegation;
 			if (!stale) return;
 			activeDelegation = undefined;
@@ -794,6 +837,8 @@ export function createModelRouterExtension(
 			workflow: DelegationWorkflow,
 		): Promise<void> => {
 			const { runId, controller } = workflow;
+			let replayOriginalPending = false;
+			let cancelledDetail: Record<string, unknown> | undefined;
 			/** True once a session lifecycle reset orphaned this workflow; every append/replay/message path bails. */
 			const invalidated = (): boolean => workflow.generation !== delegationGeneration;
 			const record = (status: DelegationEntryStatus, detail: Record<string, unknown> = {}): void => {
@@ -812,13 +857,15 @@ export function createModelRouterExtension(
 				});
 			};
 			const cancelled = (detail: Record<string, unknown> = {}): void => {
-				record("cancelled", { reason: String(controller.signal.reason ?? "cancelled"), ...detail });
+				if (invalidated()) return;
+				cancelledDetail = { reason: String(controller.signal.reason ?? "cancelled"), ...detail };
 			};
 			const replayOriginal = (status: DelegationEntryStatus, reason: string): void => {
 				if (invalidated()) return;
 				record(status, { reason });
 				releaseDelegation(runId, ctx);
 				armParentMeasurement(runId, workflow.request, "prefix");
+				replayOriginalPending = true;
 				pi.sendUserMessage(workflow.request, { deliverAs: "followUp" });
 			};
 			let delegated: { agent: AgentDefinition; task: string; model: string } | undefined;
@@ -929,7 +976,11 @@ export function createModelRouterExtension(
 				if (delegated) return childFailure(reason);
 				return replayOriginal("failed", reason);
 			} finally {
+				if (!replayOriginalPending) {
+					await restoreAutomaticBaseline(ctx, workflow.generation);
+				}
 				releaseDelegation(runId, ctx);
+				if (cancelledDetail) record("cancelled", cancelledDetail);
 			}
 		};
 
@@ -1125,6 +1176,7 @@ export function createModelRouterExtension(
 						config = await readConfig({ cwd: ctx.cwd });
 						const runtime = ensureState(ctx);
 						if (!config.enabled && runtime.mode === "auto") {
+							automaticRouteGeneration = undefined;
 							runtime.mode = "off";
 							persist(ctx);
 						} else {
@@ -1137,6 +1189,7 @@ export function createModelRouterExtension(
 					config = await readConfig({ cwd: ctx.cwd });
 					const runtime = ensureState(ctx);
 					if (!config.enabled && runtime.mode === "auto") {
+						automaticRouteGeneration = undefined;
 						runtime.mode = "off";
 						persist(ctx);
 					} else {
@@ -1172,6 +1225,7 @@ export function createModelRouterExtension(
 		pi.on("session_branch", handleSessionLifecycle);
 		pi.on("session_tree", handleSessionLifecycle);
 		pi.on("session_shutdown", async (_event: SessionShutdownEvent): Promise<void> => {
+			automaticRouteGeneration = undefined;
 			activeDelegation?.controller.abort(new Error("model-router: delegation cancelled by session shutdown"));
 			resetMeasurement("model-router: shadow cancelled by session shutdown");
 		});
@@ -1199,17 +1253,19 @@ export function createModelRouterExtension(
 			}
 		});
 
-		pi.on("agent_end", async (event: AgentEndEvent): Promise<void> => {
+		pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext): Promise<void> => {
 			if (event.willContinue === true) return;
 			const settled = pendingParentMeasurements.filter(record => record.phase === "collecting-assistant");
-			if (settled.length === 0) return;
-			pendingParentMeasurements = pendingParentMeasurements.filter(
-				record => record.phase !== "collecting-assistant",
-			);
-			for (const record of settled) {
-				clearTimeout(record.timer);
-				record.onComplete(aggregateUsage(record.assistantUsage));
+			if (settled.length > 0) {
+				pendingParentMeasurements = pendingParentMeasurements.filter(
+					record => record.phase !== "collecting-assistant",
+				);
+				for (const record of settled) {
+					clearTimeout(record.timer);
+					record.onComplete(aggregateUsage(record.assistantUsage));
+				}
 			}
+			await restoreAutomaticBaseline(ctx, delegationGeneration);
 		});
 
 		pi.registerMessageRenderer(MODEL_ROUTER_DELEGATION_MESSAGE, message => {
