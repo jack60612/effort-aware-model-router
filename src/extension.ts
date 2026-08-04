@@ -460,11 +460,7 @@ export function createModelRouterExtension(
 		const restoreAutomaticBaseline = async (ctx: ExtensionContext, generation: number): Promise<void> => {
 			if (automaticRouteGeneration !== generation) return;
 			const runtime = ensureState(ctx);
-			if (
-				runtime.mode !== "auto" ||
-				runtime.baseline === null ||
-				runtime.lastAutoModel === null
-			) {
+			if (runtime.mode !== "auto" || runtime.baseline === null || runtime.lastAutoModel === null) {
 				return;
 			}
 			const activeModel = currentModel(ctx);
