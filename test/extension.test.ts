@@ -556,7 +556,7 @@ describe("model router extension", () => {
 		expect(await harness.input("rename this symbol")).toBeUndefined();
 		expect(await harness.input("debug this cross-system race")).toBeUndefined();
 		expect(harness.classifierPrompts).toEqual(["rename this symbol", "debug this cross-system race"]);
-		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["smol", "slow"]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["smol", "base", "slow"]);
 		expect(harness.state().lastDecision).toMatchObject({ effort: "high", selector: "@slow", outcome: "routed" });
 		expect(harness.statuses.at(-1)).toContain("baseline mock/base");
 	});
@@ -699,6 +699,25 @@ describe("model router extension", () => {
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
 		expect(harness.current).toBe(base);
 	});
+	it("settles the prior automatic route before a terminal event reaches the extension", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high", "low"];
+		await harness.lifecycle();
+		await harness.input("first delayed terminal turn");
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
+
+		await harness.input("successor input before old agent_end");
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base", "smol"]);
+		expect(harness.current).toBe(smol);
+
+		await harness.agentEnd(false);
+		expect(harness.current).toBe(smol);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base", "smol"]);
+
+		await harness.agentEnd(false);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base", "smol", "base"]);
+		expect(harness.current).toBe(base);
+	});
 
 	it("invalidates an in-flight main route across successor lifecycle", async () => {
 		const harness = new Harness();
@@ -836,11 +855,11 @@ describe("model router extension", () => {
 	it("falls back to baseline on route auth failure and deduplicates its warning", async () => {
 		const harness = new Harness();
 		harness.classifications = ["high", "low", "low"];
-		harness.setModelResults = [true, false, true, false];
+		harness.setModelResults = [true, true, false, false];
 		await harness.lifecycle();
 		await harness.input("first hard");
 		await harness.input("then easy");
-		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["slow", "smol", "base"]);
+		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["slow", "base", "smol"]);
 		expect(harness.state().lastDecision).toMatchObject({
 			outcome: "baseline",
 			reason: "auth",
@@ -962,13 +981,13 @@ describe("model router extension", () => {
 		harness.classifications = ["high"];
 		await harness.lifecycle();
 		await harness.input("debug this cross-system race");
-		harness.setModelResults = [new Error("manual rejected")];
+		harness.setModelResults = [true, new Error("manual rejected")];
 
 		await harness.command("manual @smol");
 		expect(harness.state().mode).toBe("auto");
 		await harness.agentEnd(false);
 
-		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "smol", "base"]);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base", "smol"]);
 		expect(harness.current).toBe(base);
 	});
 

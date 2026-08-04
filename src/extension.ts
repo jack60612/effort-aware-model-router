@@ -146,6 +146,8 @@ interface RouteGuard {
 interface AutomaticMainTurn {
 	readonly generation: number;
 	stale: boolean;
+	/** True once the router proactively restored this token before its event arrived. */
+	settled: boolean;
 }
 
 type DelegationEntryStatus = "pending" | "delegated" | "completed" | "failed" | "cancelled" | "passed-through";
@@ -359,7 +361,7 @@ export function createModelRouterExtension(
 		};
 		const queueAutomaticMainTurn = (generation: number): void => {
 			markAutomaticMainTurnsStale();
-			automaticMainTurns.push({ generation, stale: false });
+			automaticMainTurns.push({ generation, stale: false, settled: false });
 		};
 		const waitForAutomaticRestore = async (): Promise<void> => {
 			await automaticRestorePromise;
@@ -530,6 +532,23 @@ export function createModelRouterExtension(
 			const run = automaticRestorePromise.then(() => restoreAutomaticBaselineNow(ctx, generation));
 			automaticRestorePromise = run.catch(() => undefined);
 			return run;
+		};
+		/**
+		 * A terminal event can be queued behind a successor input. Settle the
+		 * active automatic token before routing that successor, but retain a
+		 * settled stale sentinel so the delayed terminal event cannot consume
+		 * the successor token.
+		 */
+		const settlePendingAutomaticMainTurn = async (ctx: ExtensionContext): Promise<void> => {
+			if (!ctx.isIdle()) return;
+			while (automaticMainTurns[0]?.stale && automaticMainTurns[0].settled) {
+				automaticMainTurns.shift();
+			}
+			const pending = automaticMainTurns[0];
+			if (!pending || pending.stale) return;
+			pending.stale = true;
+			pending.settled = true;
+			await restoreAutomaticBaseline(ctx, pending.generation);
 		};
 
 		/** True once a guarded route was superseded: aborted, or claimed under an older delegation generation. */
@@ -1156,16 +1175,19 @@ export function createModelRouterExtension(
 				const command = parts[0] ?? "status";
 				if (command === "auto" && parts.length === 1) {
 					await waitForAutomaticRestore();
+					await settlePendingAutomaticMainTurn(ctx);
 					transitionAuto(ctx);
 					return;
 				}
 				if (command === "manual" && parts.length <= 2) {
 					await waitForAutomaticRestore();
+					await settlePendingAutomaticMainTurn(ctx);
 					await transitionManual(ctx, parts[1]);
 					return;
 				}
 				if (command === "off" && parts.length === 1) {
 					await waitForAutomaticRestore();
+					await settlePendingAutomaticMainTurn(ctx);
 					transitionOff(ctx);
 					return;
 				}
@@ -1195,6 +1217,7 @@ export function createModelRouterExtension(
 				}
 				if (command === "once" && parts.length === 2) {
 					await waitForAutomaticRestore();
+					await settlePendingAutomaticMainTurn(ctx);
 					const selector = parts[1];
 					if (!ctx.models.resolve(selector)) {
 						ctx.ui.notify(`Model router could not resolve one-shot selector ${selector}`, "warning");
@@ -1209,6 +1232,7 @@ export function createModelRouterExtension(
 				}
 				if (command === "setup" && parts.length === 1) {
 					await waitForAutomaticRestore();
+					await settlePendingAutomaticMainTurn(ctx);
 					const setupContext: RouterSetupContext = {
 						cwd: ctx.cwd,
 						hasUI: ctx.hasUI,
@@ -1243,6 +1267,8 @@ export function createModelRouterExtension(
 					return;
 				}
 				if (command === "reload" && parts.length === 1) {
+					await waitForAutomaticRestore();
+					await settlePendingAutomaticMainTurn(ctx);
 					config = await readConfig({ cwd: ctx.cwd });
 					const runtime = ensureState(ctx);
 					if (!config.enabled && runtime.mode === "auto") {
@@ -1351,12 +1377,14 @@ export function createModelRouterExtension(
 			if (!isMainIdleInput(event, ctx)) return;
 			if (event.text === "/model auto") {
 				await waitForAutomaticRestore();
+				await settlePendingAutomaticMainTurn(ctx);
 				transitionAuto(ctx);
 				return { handled: true };
 			}
 			const text = event.text.trim();
 			if (text.length === 0 || text.startsWith("/") || text.startsWith("->") || text.startsWith("=>")) return;
 			await waitForAutomaticRestore();
+			await settlePendingAutomaticMainTurn(ctx);
 			if (delegationEligible(event, ensureState(ctx))) return claimDelegation(event, ctx);
 			const guard: RouteGuard = {
 				generation: delegationGeneration,
