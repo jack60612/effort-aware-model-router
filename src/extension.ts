@@ -128,6 +128,8 @@ export interface RoutedPrompt {
 	model: Model;
 	effort?: RouteEffort;
 	thinking?: ExtensionThinkingLevel;
+	/** Ephemeral identity for a detached restore; never persisted or rendered. */
+	automaticRouteToken?: number;
 }
 
 /**
@@ -141,10 +143,13 @@ interface RouteGuard {
 	readonly signal: AbortSignal;
 	/** Main-session input, rather than a detached delegation route. */
 	readonly automaticMainTurn?: boolean;
+	/** Existing detached automatic route owner inherited by a short/no-route input. */
+	readonly inheritedAutomaticRouteToken?: number;
 }
 
 interface AutomaticMainTurn {
 	readonly generation: number;
+	readonly routeToken?: number;
 	stale: boolean;
 	/** True once the router proactively restored this token before its event arrived. */
 	settled: boolean;
@@ -325,6 +330,8 @@ export function createModelRouterExtension(
 		/** Bumped on session start/switch/branch/tree so an in-flight workflow can never write into a successor session. */
 		let delegationGeneration = 0;
 		let automaticRouteGeneration: number | undefined;
+		let automaticRouteTokenSequence = 0;
+		let automaticRouteToken: number | undefined;
 		/** FIFO turn fence because public agent_end has no turn/session identifier. */
 		const automaticMainTurns: AutomaticMainTurn[] = [];
 		/** Serializes router-owned baseline restores with later router controls and inputs. */
@@ -356,12 +363,16 @@ export function createModelRouterExtension(
 				return false;
 			}
 		};
+		const invalidateAutomaticRoute = (): void => {
+			automaticRouteGeneration = undefined;
+			automaticRouteToken = undefined;
+		};
 		const markAutomaticMainTurnsStale = (): void => {
 			for (const turn of automaticMainTurns) turn.stale = true;
 		};
-		const queueAutomaticMainTurn = (generation: number): void => {
+		const queueAutomaticMainTurn = (generation: number, routeToken?: number): void => {
 			markAutomaticMainTurnsStale();
-			automaticMainTurns.push({ generation, stale: false, settled: false });
+			automaticMainTurns.push({ generation, routeToken, stale: false, settled: false });
 		};
 		const waitForAutomaticRestore = async (): Promise<void> => {
 			await automaticRestorePromise;
@@ -421,7 +432,7 @@ export function createModelRouterExtension(
 				return;
 			}
 			markAutomaticMainTurnsStale();
-			automaticRouteGeneration = undefined;
+			invalidateAutomaticRoute();
 			runtime.mode = "auto";
 			runtime.baseline = current;
 			runtime.observedModel = current;
@@ -434,7 +445,7 @@ export function createModelRouterExtension(
 		const transitionOff = (ctx: ExtensionContext): void => {
 			const runtime = ensureState(ctx);
 			markAutomaticMainTurnsStale();
-			automaticRouteGeneration = undefined;
+			invalidateAutomaticRoute();
 			if (runtime.mode === "off") return;
 			runtime.mode = "off";
 			runtime.observedModel = identityOf(currentModel(ctx));
@@ -474,7 +485,7 @@ export function createModelRouterExtension(
 				return;
 			}
 			markAutomaticMainTurnsStale();
-			automaticRouteGeneration = undefined;
+			invalidateAutomaticRoute();
 			runtime.mode = "manual";
 			runtime.baseline = manual;
 			runtime.observedModel = manual;
@@ -483,8 +494,23 @@ export function createModelRouterExtension(
 			persist(ctx);
 			ctx.ui.notify(`Manual routing pinned to ${modelLabel(manual)}`, "info");
 		};
-		const restoreAutomaticBaselineNow = async (ctx: ExtensionContext, generation: number): Promise<void> => {
-			if (automaticRouteGeneration !== generation) return;
+		const restoreAutomaticBaselineNow = async (
+			ctx: ExtensionContext,
+			generation: number,
+			expectedToken?: number,
+		): Promise<void> => {
+			if (
+				automaticRouteGeneration !== generation ||
+				(expectedToken !== undefined && automaticRouteToken !== expectedToken)
+			) {
+				return;
+			}
+			if (
+				expectedToken !== undefined &&
+				automaticMainTurns.some(turn => !turn.stale && turn.routeToken === expectedToken)
+			) {
+				return;
+			}
 			const runtime = ensureState(ctx);
 			if (runtime.mode !== "auto" || runtime.baseline === null || runtime.lastAutoModel === null) {
 				return;
@@ -496,7 +522,7 @@ export function createModelRouterExtension(
 			if (!baselineModel) {
 				warnOnce(ctx, "baseline", "Model router could not resolve its stored baseline model");
 				persist(ctx);
-				automaticRouteGeneration = undefined;
+				invalidateAutomaticRoute();
 				return;
 			}
 			const baselineIdentity = identityOf(baselineModel);
@@ -504,12 +530,13 @@ export function createModelRouterExtension(
 				runtime.observedModel = baselineIdentity;
 				runtime.lastAutoModel = baselineIdentity;
 				persist(ctx);
-				automaticRouteGeneration = undefined;
+				invalidateAutomaticRoute();
 				return;
 			}
 			const switched = await switchModel(baselineModel);
 			if (
 				automaticRouteGeneration !== generation ||
+				(expectedToken !== undefined && automaticRouteToken !== expectedToken) ||
 				runtime.mode !== "auto" ||
 				!modelsEqual(runtime.lastAutoModel ?? undefined, identityOf(activeModel) ?? undefined)
 			) {
@@ -520,16 +547,22 @@ export function createModelRouterExtension(
 				runtime.observedModel = baselineIdentity;
 				runtime.lastAutoModel = baselineIdentity;
 				persist(ctx);
-				automaticRouteGeneration = undefined;
+				invalidateAutomaticRoute();
 				return;
 			}
 			if (!modelsEqual(currentModel(ctx), activeModel)) return;
 			warnOnce(ctx, "baseline-auth", "Model router could not authenticate its stored baseline model");
 			persist(ctx);
-			automaticRouteGeneration = undefined;
+			invalidateAutomaticRoute();
 		};
-		const restoreAutomaticBaseline = (ctx: ExtensionContext, generation: number): Promise<void> => {
-			const run = automaticRestorePromise.then(() => restoreAutomaticBaselineNow(ctx, generation));
+		const restoreAutomaticBaseline = (
+			ctx: ExtensionContext,
+			generation: number,
+			expectedToken?: number,
+		): Promise<void> => {
+			const run = automaticRestorePromise.then(() =>
+				restoreAutomaticBaselineNow(ctx, generation, expectedToken),
+			);
 			automaticRestorePromise = run.catch(() => undefined);
 			return run;
 		};
@@ -548,7 +581,7 @@ export function createModelRouterExtension(
 			if (!pending || pending.stale) return;
 			pending.stale = true;
 			pending.settled = true;
-			await restoreAutomaticBaseline(ctx, pending.generation);
+			await restoreAutomaticBaseline(ctx, pending.generation, pending.routeToken);
 		};
 
 		/** True once a guarded route was superseded: aborted, or claimed under an older delegation generation. */
@@ -638,10 +671,15 @@ export function createModelRouterExtension(
 			if (routeSuperseded(guard)) return;
 			const runtime = ensureState(ctx);
 			const oneShotSelector = runtime.oneShotSelector;
-			if (guard?.automaticMainTurn === true) markAutomaticMainTurnsStale();
+			if (
+				guard?.automaticMainTurn === true &&
+				guard.inheritedAutomaticRouteToken === undefined
+			) {
+				markAutomaticMainTurnsStale();
+			}
 			if (oneShotSelector !== undefined) {
 				markAutomaticMainTurnsStale();
-				automaticRouteGeneration = undefined;
+				invalidateAutomaticRoute();
 			}
 			if (oneShotSelector === undefined && runtime.mode !== "auto") return;
 			const activeModel = currentModel(ctx);
@@ -653,7 +691,7 @@ export function createModelRouterExtension(
 					runtime.lastAutoModel ?? undefined,
 				);
 				if (activeIdentity && changedFromObserved && differsFromLastAutomatic) {
-					automaticRouteGeneration = undefined;
+					invalidateAutomaticRoute();
 					runtime.mode = "manual";
 					runtime.baseline = activeIdentity;
 					runtime.observedModel = activeIdentity;
@@ -775,9 +813,14 @@ export function createModelRouterExtension(
 			if (routeSuperseded(guard)) return;
 			const targetIdentity = identityOf(target);
 			if (!targetIdentity) return;
-			if (oneShotSelector === undefined) {
+			const appliedAutomaticRouteToken =
+				oneShotSelector === undefined ? ++automaticRouteTokenSequence : undefined;
+			if (appliedAutomaticRouteToken !== undefined) {
+				automaticRouteToken = appliedAutomaticRouteToken;
 				automaticRouteGeneration = delegationGeneration;
-				if (guard?.automaticMainTurn === true) queueAutomaticMainTurn(delegationGeneration);
+				if (guard?.automaticMainTurn === true) {
+					queueAutomaticMainTurn(delegationGeneration, appliedAutomaticRouteToken);
+				}
 			}
 			const profileEffort = effort
 				? resolveThinkingEffort(effort, config.thinkingProfiles[formatModelSelector(target)])
@@ -805,6 +848,7 @@ export function createModelRouterExtension(
 				model: target,
 				effort,
 				thinking: thinking ? THINKING_LEVEL_BY_EFFORT[thinking] : undefined,
+				automaticRouteToken: appliedAutomaticRouteToken,
 			};
 		};
 
@@ -843,7 +887,7 @@ export function createModelRouterExtension(
 		const invalidateDelegation = (reason: string): void => {
 			delegationGeneration += 1;
 			markAutomaticMainTurnsStale();
-			automaticRouteGeneration = undefined;
+			invalidateAutomaticRoute();
 			const stale = activeDelegation;
 			if (!stale) return;
 			activeDelegation = undefined;
@@ -904,9 +948,9 @@ export function createModelRouterExtension(
 		): Promise<void> => {
 			/** Keep cancellation entries behind the awaited restore/release settlement. */
 			let cancelledDetail: Record<string, unknown> | undefined;
-			const { runId, controller } = workflow;
 			let replayOriginalPending = false;
 			let automaticRouteApplied = false;
+			let automaticRouteAppliedToken: number | undefined;
 			/** True once a session lifecycle reset orphaned this workflow; every append/replay/message path bails. */
 			const invalidated = (): boolean => workflow.generation !== delegationGeneration;
 			const record = (status: DelegationEntryStatus, detail: Record<string, unknown> = {}): void => {
@@ -930,7 +974,9 @@ export function createModelRouterExtension(
 			};
 			const replayOriginal = (status: DelegationEntryStatus, reason: string): void => {
 				if (invalidated()) return;
-				if (automaticRouteApplied) queueAutomaticMainTurn(workflow.generation);
+				if (automaticRouteApplied) {
+					queueAutomaticMainTurn(workflow.generation, automaticRouteAppliedToken);
+				}
 				record(status, { reason });
 				releaseDelegation(runId, ctx);
 				armParentMeasurement(runId, workflow.request, "prefix");
@@ -965,6 +1011,7 @@ export function createModelRouterExtension(
 				if (controller.signal.aborted) return cancelled();
 				if (!routed) return replayOriginal("passed-through", "no automatic route was applied");
 				automaticRouteApplied = true;
+				automaticRouteAppliedToken = routed.automaticRouteToken;
 				const selector = formatModelSelector(routed.model);
 				const discovery = await discover(ctx.cwd);
 				if (controller.signal.aborted) return cancelled();
@@ -1045,8 +1092,8 @@ export function createModelRouterExtension(
 				if (delegated) return childFailure(reason);
 				return replayOriginal("failed", reason);
 			} finally {
-				if (!replayOriginalPending) {
-					await restoreAutomaticBaseline(ctx, workflow.generation);
+				if (!replayOriginalPending && automaticRouteAppliedToken !== undefined) {
+					await restoreAutomaticBaseline(ctx, workflow.generation, automaticRouteAppliedToken);
 				}
 				releaseDelegation(runId, ctx);
 				if (cancelledDetail) record("cancelled", cancelledDetail);
@@ -1257,7 +1304,7 @@ export function createModelRouterExtension(
 						const runtime = ensureState(ctx);
 						if (!config.enabled && runtime.mode === "auto") {
 							markAutomaticMainTurnsStale();
-							automaticRouteGeneration = undefined;
+							invalidateAutomaticRoute();
 							runtime.mode = "off";
 							persist(ctx);
 						} else {
@@ -1273,7 +1320,7 @@ export function createModelRouterExtension(
 					const runtime = ensureState(ctx);
 					if (!config.enabled && runtime.mode === "auto") {
 						markAutomaticMainTurnsStale();
-						automaticRouteGeneration = undefined;
+						invalidateAutomaticRoute();
 						runtime.mode = "off";
 						persist(ctx);
 					} else {
@@ -1312,7 +1359,7 @@ export function createModelRouterExtension(
 		pi.on("session_tree", handleSessionLifecycle);
 		pi.on("session_shutdown", async (_event: SessionShutdownEvent): Promise<void> => {
 			markAutomaticMainTurnsStale();
-			automaticRouteGeneration = undefined;
+			invalidateAutomaticRoute();
 			activeDelegation?.controller.abort(new Error("model-router: delegation cancelled by session shutdown"));
 			resetMeasurement("model-router: shadow cancelled by session shutdown");
 			await waitForAutomaticRestore();
@@ -1355,7 +1402,7 @@ export function createModelRouterExtension(
 				}
 			}
 			if (automaticMainTurn && !automaticMainTurn.stale) {
-				await restoreAutomaticBaseline(ctx, automaticMainTurn.generation);
+				await restoreAutomaticBaseline(ctx, automaticMainTurn.generation, automaticMainTurn.routeToken);
 			}
 		});
 
@@ -1390,11 +1437,27 @@ export function createModelRouterExtension(
 			if (text.length === 0 || text.startsWith("/") || text.startsWith("->") || text.startsWith("=>")) return;
 			await waitForAutomaticRestore();
 			await settlePendingAutomaticMainTurn(ctx);
-			if (delegationEligible(event, ensureState(ctx))) return claimDelegation(event, ctx);
+			const runtime = ensureState(ctx);
+			const inheritedAutomaticRouteToken =
+				runtime.mode === "auto" &&
+				runtime.oneShotSelector === undefined &&
+				automaticRouteToken !== undefined &&
+				runtime.lastAutoModel !== null &&
+				modelsEqual(
+					currentModel(ctx),
+					ctx.models.resolve(formatModelSelector(runtime.lastAutoModel)),
+				)
+					? automaticRouteToken
+					: undefined;
+			if (inheritedAutomaticRouteToken !== undefined) {
+				queueAutomaticMainTurn(delegationGeneration, inheritedAutomaticRouteToken);
+			}
+			if (delegationEligible(event, runtime)) return claimDelegation(event, ctx);
 			const guard: RouteGuard = {
 				generation: delegationGeneration,
 				signal: new AbortController().signal,
 				automaticMainTurn: true,
+				inheritedAutomaticRouteToken,
 			};
 			const routed = await routePrompt(event, ctx, guard);
 			if (routeSuperseded(guard)) return;

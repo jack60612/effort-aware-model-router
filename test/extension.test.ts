@@ -1628,6 +1628,32 @@ describe("model router delegation", () => {
 		expect(harness.customMessages).toEqual([]);
 		expect(harness.userMessages).toEqual([]);
 	});
+	it("does not restore a detached child over a later ordinary main route", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low", "high"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		const deferredResult = Promise.withResolvers<SingleResult>();
+		harness.executeResults = [() => deferredResult.promise];
+
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.executeCalls.length === 1);
+
+		await harness.input("the successor ordinary request");
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "slow"]);
+		const stateEntryCountBeforeChildCompletion = harness.entries.filter(
+			entry => entry.customType === MODEL_ROUTER_STATE_ENTRY,
+		).length;
+
+		deferredResult.resolve(singleResult({ output: "child output text" }));
+		await harness.settle(() => harness.customMessages.length === 1);
+
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "slow"]);
+		expect(harness.current).toBe(slow);
+		const stateEntryCountAfterChildCompletion = harness.entries.filter(
+			entry => entry.customType === MODEL_ROUTER_STATE_ENTRY,
+		).length;
+		expect(stateEntryCountAfterChildCompletion).toBe(stateEntryCountBeforeChildCompletion);
+	});
 
 	it("reports no active workflow for /route cancel when idle", async () => {
 		const harness = await enabledHarness();
