@@ -570,6 +570,9 @@ describe("model router extension", () => {
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
 
 		await harness.agentEnd(false);
+		const entriesAfterRestore = harness.entries.length;
+		await harness.agentEnd(false);
+		expect(harness.entries).toHaveLength(entriesAfterRestore);
 
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
 		expect(harness.current).toBe(base);
@@ -664,6 +667,27 @@ describe("model router extension", () => {
 		const callsBeforeTerminalEvent = harness.setModelCalls.length;
 		await harness.agentEnd(false);
 		expect(harness.setModelCalls.slice(callsBeforeTerminalEvent).map(model => model.id)).not.toContain("base");
+	});
+
+	it("invalidates an in-flight main route across successor lifecycle", async () => {
+		const harness = new Harness();
+		const deferred = Promise.withResolvers<RouteEffort>();
+		harness.classifications = [() => deferred.promise];
+		await harness.lifecycle();
+		const input = harness.input("debug this cross-system race");
+		await harness.settle(() => harness.classifierPrompts.length === 1);
+		const entriesBeforeLifecycle = harness.entries.length;
+
+		await harness.lifecycle("session_switch");
+		deferred.resolve("high");
+		expect(await input).toBeUndefined();
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.thinkingCalls).toEqual([]);
+		expect(harness.entries).toHaveLength(entriesBeforeLifecycle);
+
+		harness.classifications = ["high"];
+		await harness.input("fresh successor prompt");
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
 	});
 
 	it("avoids same-model resets, clamps effort, and does not mutate thinking for plain targets", async () => {

@@ -470,6 +470,7 @@ export function createModelRouterExtension(
 			if (!baselineModel) {
 				warnOnce(ctx, "baseline", "Model router could not resolve its stored baseline model");
 				persist(ctx);
+				automaticRouteGeneration = undefined;
 				return;
 			}
 			const baselineIdentity = identityOf(baselineModel);
@@ -477,6 +478,7 @@ export function createModelRouterExtension(
 				runtime.observedModel = baselineIdentity;
 				runtime.lastAutoModel = baselineIdentity;
 				persist(ctx);
+				automaticRouteGeneration = undefined;
 				return;
 			}
 			const switched = await switchModel(baselineModel);
@@ -492,11 +494,13 @@ export function createModelRouterExtension(
 				runtime.observedModel = baselineIdentity;
 				runtime.lastAutoModel = baselineIdentity;
 				persist(ctx);
+				automaticRouteGeneration = undefined;
 				return;
 			}
 			if (!modelsEqual(currentModel(ctx), activeModel)) return;
 			warnOnce(ctx, "baseline-auth", "Model router could not authenticate its stored baseline model");
 			persist(ctx);
+			automaticRouteGeneration = undefined;
 		};
 
 		/** True once a guarded route was superseded: aborted, or claimed under an older delegation generation. */
@@ -1297,7 +1301,12 @@ export function createModelRouterExtension(
 			const text = event.text.trim();
 			if (text.length === 0 || text.startsWith("/") || text.startsWith("->") || text.startsWith("=>")) return;
 			if (delegationEligible(event, ensureState(ctx))) return claimDelegation(event, ctx);
-			const routed = await routePrompt(event, ctx);
+			const guard: RouteGuard = {
+				generation: delegationGeneration,
+				signal: new AbortController().signal,
+			};
+			const routed = await routePrompt(event, ctx, guard);
+			if (routeSuperseded(guard)) return;
 			startShadowMeasurement(event, ctx, routed);
 		});
 	};
