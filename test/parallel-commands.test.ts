@@ -578,7 +578,7 @@ describe("parallel command handler", () => {
 });
 
 describe("parallel command extension wiring", () => {
-	it("registers /parallel alongside /route without new event handlers", async () => {
+	it("registers /parallel alongside /route without changing parallel command behavior", async () => {
 		const commands = new Map<string, CommandOptions["handler"]>();
 		const handlers: string[] = [];
 		const coordinator = new FakeCoordinator();
@@ -619,6 +619,9 @@ describe("parallel command extension wiring", () => {
 			"agent_end",
 			"input",
 			"message_end",
+			"session_before_branch",
+			"session_before_switch",
+			"session_before_tree",
 			"session_branch",
 			"session_shutdown",
 			"session_start",

@@ -243,6 +243,8 @@ There is one unavoidable public-API ambiguity: selecting the **same model as the
 
 The baseline is the safe model captured when router state is first created. `/route auto`, `/route manual`, an explicit manual selector, or an inferred external model change can update it as described above. Automatic route changes do not rewrite OMP's persisted model-role configuration.
 
+Automatic target selection is scoped to the active task. During a normal automatic turn, the selected target remains active through the response and returns to the stored baseline only after terminal `agent_end`; an `agent_end` with `willContinue: true` is a continuation phase and does not reset. Detached delegation likewise keeps its selected target through planning and child work, then restores the baseline after the detached workflow settles. These restores apply only to automatic routes: manual mode, `/route once`, and an external model change recognized as manual are never overwritten.
+
 The router attempts to return to the stored baseline when:
 
 - no configured classifier resolves with credentials;
