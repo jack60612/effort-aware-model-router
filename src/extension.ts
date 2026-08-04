@@ -473,12 +473,7 @@ export function createModelRouterExtension(
 				}
 				if (!modelsEqual(currentModel(ctx), selected) && !(await switchModel(selected))) {
 					if (automaticOwnerGeneration !== undefined && automaticOwnerToken !== undefined) {
-						await restoreAutomaticBaseline(
-							ctx,
-							automaticOwnerGeneration,
-							automaticOwnerToken,
-							true,
-						);
+						await restoreAutomaticBaseline(ctx, automaticOwnerGeneration, automaticOwnerToken, true);
 					}
 					warnOnce(
 						ctx,
@@ -686,10 +681,7 @@ export function createModelRouterExtension(
 			if (routeSuperseded(guard)) return;
 			const runtime = ensureState(ctx);
 			const oneShotSelector = runtime.oneShotSelector;
-			if (
-				guard?.automaticMainTurn === true &&
-				guard.inheritedAutomaticRouteToken === undefined
-			) {
+			if (guard?.automaticMainTurn === true && guard.inheritedAutomaticRouteToken === undefined) {
 				markAutomaticMainTurnsStale();
 			}
 			if (oneShotSelector !== undefined) {
@@ -828,8 +820,7 @@ export function createModelRouterExtension(
 			if (routeSuperseded(guard)) return;
 			const targetIdentity = identityOf(target);
 			if (!targetIdentity) return;
-			const appliedAutomaticRouteToken =
-				oneShotSelector === undefined ? ++automaticRouteTokenSequence : undefined;
+			const appliedAutomaticRouteToken = oneShotSelector === undefined ? ++automaticRouteTokenSequence : undefined;
 			if (appliedAutomaticRouteToken !== undefined) {
 				automaticRouteToken = appliedAutomaticRouteToken;
 				automaticRouteGeneration = delegationGeneration;
@@ -1464,10 +1455,7 @@ export function createModelRouterExtension(
 				runtime.oneShotSelector === undefined &&
 				automaticRouteToken !== undefined &&
 				runtime.lastAutoModel !== null &&
-				modelsEqual(
-					currentModel(ctx),
-					ctx.models.resolve(formatModelSelector(runtime.lastAutoModel)),
-				)
+				modelsEqual(currentModel(ctx), ctx.models.resolve(formatModelSelector(runtime.lastAutoModel)))
 					? automaticRouteToken
 					: undefined;
 			if (inheritedAutomaticRouteToken !== undefined) {
