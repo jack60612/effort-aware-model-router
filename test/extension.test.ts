@@ -625,9 +625,9 @@ describe("model router extension", () => {
 		const restore = harness.agentEnd(false);
 		await harness.settle(() => harness.setModelCalls.length === 2);
 
-		await harness.lifecycle("session_switch");
+		const lifecycle = harness.lifecycle("session_switch");
 		pending.resolve(true);
-		await restore;
+		await lifecycle;
 
 		expect(harness.entries).toHaveLength(entriesBeforeRestore);
 		expect(harness.state()).toMatchObject({
@@ -655,18 +655,49 @@ describe("model router extension", () => {
 		expect(harness.entries).toHaveLength(entriesBeforeRestore);
 		expect(harness.notifications.some(item => item.message.includes("authenticate its stored baseline"))).toBe(false);
 	});
-
-	it("does not restore a stale automatic target after a successor lifecycle", async () => {
+	it("serializes route controls behind an in-flight automatic restore", async () => {
 		const harness = new Harness();
 		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		const pending = Promise.withResolvers<boolean>();
+		harness.setModelResults = [() => pending.promise];
+		const restore = harness.agentEnd(false);
+		await harness.settle(() => harness.setModelCalls.length === 2);
+
+		let offSettled = false;
+		const off = harness.command("off").then(() => {
+			offSettled = true;
+		});
+		await Promise.resolve();
+		expect(offSettled).toBe(false);
+
+		pending.resolve(true);
+		await restore;
+		await off;
+		expect(harness.state().mode).toBe("off");
+		expect(harness.current).toBe(base);
+	});
+
+	it("fences a delayed old terminal event from a successor automatic route", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high", "high"];
 		await harness.lifecycle();
 		await harness.input("debug this cross-system race");
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
 
 		await harness.lifecycle("session_switch");
-		const callsBeforeTerminalEvent = harness.setModelCalls.length;
+		await harness.input("successor cross-system race");
+		expect(harness.current).toBe(slow);
+
+		const callsBeforeTerminalEvents = harness.setModelCalls.length;
 		await harness.agentEnd(false);
-		expect(harness.setModelCalls.slice(callsBeforeTerminalEvent).map(model => model.id)).not.toContain("base");
+		expect(harness.setModelCalls.slice(callsBeforeTerminalEvents).map(model => model.id)).not.toContain("base");
+		expect(harness.current).toBe(slow);
+
+		await harness.agentEnd(false);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "base"]);
+		expect(harness.current).toBe(base);
 	});
 
 	it("invalidates an in-flight main route across successor lifecycle", async () => {
@@ -1407,9 +1438,17 @@ describe("model router delegation", () => {
 
 		await harness.input("the original standalone request");
 		await harness.settle(() => harness.userMessages.length === 1);
-		expect(await harness.input("a fresh standalone request")).toBeUndefined();
+		let freshSettled = false;
+		const fresh = harness.input("a fresh standalone request").then(result => {
+			freshSettled = true;
+			return result;
+		});
+		await Promise.resolve();
+		expect(freshSettled).toBe(false);
 
 		pending.resolve(true);
+		expect(await fresh).toEqual({ handled: true });
+		await harness.settle(() => harness.userMessages.length === 2);
 		await harness.settle(() => harness.statuses.at(-1)?.includes("(idle)") === true);
 		expect(await harness.input("a fresh standalone request")).toEqual({ handled: true });
 	});
