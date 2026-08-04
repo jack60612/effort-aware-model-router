@@ -1382,6 +1382,11 @@ export function createModelRouterExtension(
 				return { handled: true };
 			}
 			const text = event.text.trim();
+			if (text.startsWith("/model ")) {
+				await waitForAutomaticRestore();
+				await settlePendingAutomaticMainTurn(ctx);
+				return;
+			}
 			if (text.length === 0 || text.startsWith("/") || text.startsWith("->") || text.startsWith("=>")) return;
 			await waitForAutomaticRestore();
 			await settlePendingAutomaticMainTurn(ctx);

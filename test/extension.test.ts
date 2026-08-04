@@ -669,12 +669,18 @@ describe("model router extension", () => {
 		const off = harness.command("off").then(() => {
 			offSettled = true;
 		});
+		let modelSettled = false;
+		const modelInput = harness.input("/model @smol").then(() => {
+			modelSettled = true;
+		});
 		await Promise.resolve();
 		expect(offSettled).toBe(false);
+		expect(modelSettled).toBe(false);
 
 		pending.resolve(true);
 		await restore;
 		await off;
+		await modelInput;
 		expect(harness.state().mode).toBe("off");
 		expect(harness.current).toBe(base);
 	});
