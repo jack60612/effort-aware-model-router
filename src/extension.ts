@@ -419,7 +419,6 @@ export function createModelRouterExtension(
 		};
 
 		const transitionManual = async (ctx: ExtensionContext, selector: string | undefined): Promise<void> => {
-			automaticRouteGeneration = undefined;
 			const runtime = ensureState(ctx);
 			let selected = currentModel(ctx);
 			if (selector) {
@@ -449,6 +448,7 @@ export function createModelRouterExtension(
 				persist(ctx);
 				return;
 			}
+			automaticRouteGeneration = undefined;
 			runtime.mode = "manual";
 			runtime.baseline = manual;
 			runtime.observedModel = manual;
@@ -483,13 +483,23 @@ export function createModelRouterExtension(
 				persist(ctx);
 				return;
 			}
-			if (!(await switchModel(baselineModel))) {
-				warnOnce(ctx, "baseline-auth", "Model router could not authenticate its stored baseline model");
+			const switched = await switchModel(baselineModel);
+			if (
+				automaticRouteGeneration !== generation ||
+				runtime.mode !== "auto" ||
+				!modelsEqual(runtime.lastAutoModel ?? undefined, identityOf(activeModel) ?? undefined)
+			) {
+				return;
+			}
+			if (switched) {
+				if (!modelsEqual(currentModel(ctx), baselineModel)) return;
+				runtime.observedModel = baselineIdentity;
+				runtime.lastAutoModel = baselineIdentity;
 				persist(ctx);
 				return;
 			}
-			runtime.observedModel = baselineIdentity;
-			runtime.lastAutoModel = baselineIdentity;
+			if (!modelsEqual(currentModel(ctx), activeModel)) return;
+			warnOnce(ctx, "baseline-auth", "Model router could not authenticate its stored baseline model");
 			persist(ctx);
 		};
 
@@ -836,9 +846,10 @@ export function createModelRouterExtension(
 			ctx: ExtensionContext,
 			workflow: DelegationWorkflow,
 		): Promise<void> => {
+			/** Keep cancellation entries behind the awaited restore/release settlement. */
+			let cancelledDetail: Record<string, unknown> | undefined;
 			const { runId, controller } = workflow;
 			let replayOriginalPending = false;
-			let cancelledDetail: Record<string, unknown> | undefined;
 			/** True once a session lifecycle reset orphaned this workflow; every append/replay/message path bails. */
 			const invalidated = (): boolean => workflow.generation !== delegationGeneration;
 			const record = (status: DelegationEntryStatus, detail: Record<string, unknown> = {}): void => {
@@ -882,7 +893,6 @@ export function createModelRouterExtension(
 					},
 					{ triggerTurn: false },
 				);
-				releaseDelegation(runId, ctx);
 				armParentMeasurement(runId, workflow.request, "prefix");
 				pi.sendUserMessage(
 					`${workflow.request}\n\nWarning: a delegated subagent attempt failed and may have produced side effects; inspect the current state before repeating work.`,

@@ -235,7 +235,7 @@ class Harness {
 	parentSession: string | undefined;
 	contextTokens = 100;
 	contextAvailable = true;
-	setModelResults: Array<boolean | Error> = [];
+	setModelResults: Array<boolean | Error | (() => Promise<boolean>)> = [];
 	config = routerConfig();
 	now = 1_000;
 	/** Deterministic sample source; defaults to rejecting every shadow sample. */
@@ -292,7 +292,8 @@ class Harness {
 			async setModel(selected: Model): Promise<boolean> {
 				self.setModelCalls.push(selected);
 				self.sequence.push(`setModel:${selected.id}`);
-				const result = self.setModelResults.shift() ?? true;
+				const pending = self.setModelResults.shift() ?? true;
+				const result = typeof pending === "function" ? await pending() : pending;
 				if (result instanceof Error) throw result;
 				if (result) self.current = selected as TestModel;
 				return result;
@@ -610,6 +611,48 @@ describe("model router extension", () => {
 		expect(harness.current).toBe(smol);
 	});
 
+	it("fences an in-flight baseline restore after a successor lifecycle", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		const pending = Promise.withResolvers<boolean>();
+		harness.setModelResults = [() => pending.promise];
+		const entriesBeforeRestore = harness.entries.length;
+		const restore = harness.agentEnd(false);
+		await harness.settle(() => harness.setModelCalls.length === 2);
+
+		await harness.lifecycle("session_switch");
+		pending.resolve(true);
+		await restore;
+
+		expect(harness.entries).toHaveLength(entriesBeforeRestore);
+		expect(harness.state()).toMatchObject({
+			mode: "auto",
+			lastAutoModel: { provider: "mock", id: "slow" },
+		});
+	});
+
+	it("fences an in-flight baseline restore after an external model change", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		const pending = Promise.withResolvers<boolean>();
+		harness.setModelResults = [() => pending.promise];
+		const entriesBeforeRestore = harness.entries.length;
+		const restore = harness.agentEnd(false);
+		await harness.settle(() => harness.setModelCalls.length === 2);
+
+		harness.current = smol;
+		pending.resolve(false);
+		await restore;
+
+		expect(harness.current).toBe(smol);
+		expect(harness.entries).toHaveLength(entriesBeforeRestore);
+		expect(harness.notifications.some(item => item.message.includes("authenticate its stored baseline"))).toBe(false);
+	});
+
 	it("does not restore a stale automatic target after a successor lifecycle", async () => {
 		const harness = new Harness();
 		harness.classifications = ["high"];
@@ -857,6 +900,21 @@ describe("model router extension", () => {
 		await harness.command("manual @slow");
 		expect(harness.state().mode).toBe("auto");
 		expect(harness.notifications.some(item => item.message.includes("authenticate manual selector"))).toBe(true);
+	});
+
+	it("keeps automatic reset eligibility when a manual selector switch rejects", async () => {
+		const harness = new Harness();
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("debug this cross-system race");
+		harness.setModelResults = [new Error("manual rejected")];
+
+		await harness.command("manual @smol");
+		expect(harness.state().mode).toBe("auto");
+		await harness.agentEnd(false);
+
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow", "smol", "base"]);
+		expect(harness.current).toBe(base);
 	});
 
 	it("skips unsupported sources, busy/pending/subagent sessions, commands, queues, and blank input", async () => {
@@ -1198,6 +1256,10 @@ describe("model router delegation", () => {
 			expect(harness.executeCalls).toEqual([]);
 			expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
 			expect(harness.planCalls).toHaveLength(1);
+			expect(harness.current).toBe(smol);
+			await harness.agentEnd(false);
+			expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
+			expect(harness.current).toBe(base);
 
 			expect(await harness.input("a new standalone request")).toEqual({ handled: true });
 			await harness.settle(() => harness.userMessages.length === 2);
@@ -1311,6 +1373,23 @@ describe("model router delegation", () => {
 		expect(harness.current).toBe(base);
 	});
 
+	it("keeps child-failure ownership until baseline restoration settles", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		harness.executeResults = [singleResult({ exitCode: 1, error: "child exploded", output: "" })];
+		const pending = Promise.withResolvers<boolean>();
+		harness.setModelResults = [true, () => pending.promise];
+
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+		expect(await harness.input("a fresh standalone request")).toBeUndefined();
+
+		pending.resolve(true);
+		await harness.settle(() => harness.statuses.at(-1)?.includes("(idle)") === true);
+		expect(await harness.input("a fresh standalone request")).toEqual({ handled: true });
+	});
+
 	it("treats a throwing child as a guarded failure", async () => {
 		const harness = await enabledHarness();
 		harness.classifications = ["low"];
@@ -1335,6 +1414,8 @@ describe("model router delegation", () => {
 		await harness.settle(() => harness.delegationEntries().some(entry => entry.status === "cancelled"));
 		expect(harness.userMessages).toEqual([]);
 		expect(harness.executeCalls).toEqual([]);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
+		expect(harness.current).toBe(base);
 
 		harness.classifications = ["low"];
 		harness.planResults = [{ delegate: false, reason: "later" }];
