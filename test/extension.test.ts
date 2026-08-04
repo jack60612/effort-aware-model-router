@@ -1563,6 +1563,53 @@ describe("model router delegation", () => {
 		expect(harness.thinkingCalls).toEqual(["high", "inherit", "low"]);
 		expect(harness.thinkingLevel).toBe("low");
 	});
+	it("preserves a successor fence when detached replay is queued", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low", "high"];
+		const deferredPlan = Promise.withResolvers<DelegationPlan>();
+		harness.planResults = [() => deferredPlan.promise];
+
+		expect(await harness.input("original delegated request")).toEqual({ handled: true });
+		await harness.settle(() => harness.planCalls.length === 1);
+		await harness.input("successor main request");
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "slow"]);
+
+		deferredPlan.resolve({ delegate: false, reason: "needs context" });
+		await harness.settle(() => harness.userMessages.length === 1);
+		await harness.agentEnd(false);
+		expect(harness.current).toBe(base);
+		await harness.agentEnd(false);
+		expect(harness.current).toBe(base);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "slow", "base"]);
+	});
+
+	it("clears thinking before a detached successor fallback", async () => {
+		const harness = new Harness();
+		harness.config = delegationConfig(
+			{},
+			{
+				thresholds: { high: ["@slow"] },
+				thinkingProfiles: { "mock/slow": { high: "high" } },
+			},
+		);
+		harness.thinkingLevel = "low";
+		await harness.lifecycle();
+		harness.classifications = ["high", new Error("classifier failed")];
+		const deferredPlan = Promise.withResolvers<DelegationPlan>();
+		harness.planResults = [() => deferredPlan.promise];
+
+		expect(await harness.input("original delegated request")).toEqual({ handled: true });
+		await harness.settle(() => harness.planCalls.length === 1);
+		await harness.input("fallback successor request");
+		expect(harness.current).toBe(base);
+		expect(harness.thinkingCalls).toEqual(["high", "inherit"]);
+
+		deferredPlan.resolve({ delegate: false, reason: "needs context" });
+		await harness.settle(() => harness.userMessages.length === 1);
+		await harness.agentEnd(false);
+		await harness.agentEnd(false);
+		expect(harness.thinkingLevel).toBe("low");
+	});
 
 	it("renders success visibly without a main turn or replay", async () => {
 		const harness = await successfulDelegation();

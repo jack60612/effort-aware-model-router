@@ -382,6 +382,10 @@ export function createModelRouterExtension(
 			}
 			clearAutomaticThinkingOwnership();
 		};
+		/** Clear the effective override without dropping the snapshot needed by terminal restoration. */
+		const clearAutomaticThinkingOverride = (): void => {
+			if (automaticThinkingApplied && pi.getThinkingLevel() !== "inherit") pi.setThinkingLevel("inherit");
+		};
 		const discardAutomaticThinkingCapture = (): void => {
 			if (automaticRouteToken !== undefined || automaticThinkingApplied) return;
 			automaticBaselineThinkingCaptured = false;
@@ -417,6 +421,18 @@ export function createModelRouterExtension(
 			} else {
 				automaticMainTurns.push(nextTurn);
 			}
+		};
+		/** Do not let an obsolete detached recovery token stale a newer successor fence. */
+		const queueAutomaticRecoveryTurn = (generation: number, routeToken?: number): void => {
+			if (
+				routeToken !== undefined &&
+				automaticMainTurns.some(
+					turn => !turn.stale && !turn.settled && turn.routeToken !== undefined && turn.routeToken > routeToken,
+				)
+			) {
+				return;
+			}
+			queueAutomaticMainTurn(generation, routeToken);
 		};
 		const waitForAutomaticRestore = async (): Promise<void> => {
 			await automaticRestorePromise;
@@ -698,6 +714,7 @@ export function createModelRouterExtension(
 				runtime.observedModel = identityOf(fallbackModel);
 				runtime.lastAutoModel = identityOf(fallbackModel);
 			}
+			if (switched) clearAutomaticThinkingOverride();
 			recordRouterDecision(runtime, {
 				effort,
 				selector,
@@ -892,7 +909,7 @@ export function createModelRouterExtension(
 				if (oneShotSelector === undefined) automaticThinkingApplied = true;
 				pi.setThinkingLevel(THINKING_LEVEL_BY_EFFORT[thinking]);
 			} else if (oneShotSelector === undefined && automaticThinkingApplied) {
-				if (pi.getThinkingLevel() !== "inherit") pi.setThinkingLevel("inherit");
+				clearAutomaticThinkingOverride();
 			}
 			runtime.observedModel = targetIdentity;
 			runtime.lastAutoModel = targetIdentity;
@@ -1043,7 +1060,7 @@ export function createModelRouterExtension(
 			const replayOriginal = (status: DelegationEntryStatus, reason: string): void => {
 				if (invalidated()) return;
 				if (automaticRouteApplied) {
-					queueAutomaticMainTurn(workflow.generation, automaticRouteAppliedToken);
+					queueAutomaticRecoveryTurn(workflow.generation, automaticRouteAppliedToken);
 				}
 				record(status, { reason });
 				releaseDelegation(runId, ctx);
@@ -1066,7 +1083,7 @@ export function createModelRouterExtension(
 					{ triggerTurn: false },
 				);
 				if (automaticRouteApplied) {
-					queueAutomaticMainTurn(workflow.generation, automaticRouteAppliedToken);
+					queueAutomaticRecoveryTurn(workflow.generation, automaticRouteAppliedToken);
 					replayOriginalPending = true;
 				}
 				armParentMeasurement(runId, workflow.request, "prefix");
