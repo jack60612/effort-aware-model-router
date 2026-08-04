@@ -336,6 +336,9 @@ export function createModelRouterExtension(
 		let automaticRouteTokenSequence = 0;
 		let automaticRouteToken: number | undefined;
 		let manualControlPending = false;
+		let automaticBaselineThinkingLevel: ExtensionThinkingLevel | undefined;
+		let automaticBaselineThinkingCaptured = false;
+		let automaticThinkingApplied = false;
 		/** FIFO turn fence because public agent_end has no turn/session identifier. */
 		const automaticMainTurns: AutomaticMainTurn[] = [];
 		/** Serializes router-owned baseline restores with later router controls and inputs. */
@@ -367,7 +370,14 @@ export function createModelRouterExtension(
 				return false;
 			}
 		};
+		const resetAutomaticThinking = (): void => {
+			if (automaticThinkingApplied) pi.setThinkingLevel(automaticBaselineThinkingLevel ?? "inherit");
+			automaticThinkingApplied = false;
+			automaticBaselineThinkingCaptured = false;
+			automaticBaselineThinkingLevel = undefined;
+		};
 		const invalidateAutomaticRoute = (): void => {
+			resetAutomaticThinking();
 			automaticRouteGeneration = undefined;
 			automaticRouteToken = undefined;
 		};
@@ -778,6 +788,14 @@ export function createModelRouterExtension(
 					attempts.push({ selector: candidate, outcome: "context" });
 					continue;
 				}
+				if (
+					oneShotSelector === undefined &&
+					automaticRouteToken === undefined &&
+					!automaticBaselineThinkingCaptured
+				) {
+					automaticBaselineThinkingCaptured = true;
+					automaticBaselineThinkingLevel = pi.getThinkingLevel();
+				}
 				if (!modelsEqual(activeModel, candidateModel)) {
 					if (routeSuperseded(guard)) return;
 					const switched = await switchModel(candidateModel);
@@ -838,7 +856,10 @@ export function createModelRouterExtension(
 				? resolveThinkingEffort(effort, config.thinkingProfiles[formatModelSelector(target)])
 				: undefined;
 			const thinking = profileEffort ? clampEffortToModel(profileEffort, target) : undefined;
-			if (thinking) pi.setThinkingLevel(THINKING_LEVEL_BY_EFFORT[thinking]);
+			if (thinking) {
+				if (oneShotSelector === undefined) automaticThinkingApplied = true;
+				pi.setThinkingLevel(THINKING_LEVEL_BY_EFFORT[thinking]);
+			}
 			runtime.observedModel = targetIdentity;
 			runtime.lastAutoModel = targetIdentity;
 			recordRouterDecision(runtime, {
@@ -1010,6 +1031,10 @@ export function createModelRouterExtension(
 					},
 					{ triggerTurn: false },
 				);
+				if (automaticRouteApplied) {
+					queueAutomaticMainTurn(workflow.generation, automaticRouteAppliedToken);
+					replayOriginalPending = true;
+				}
 				armParentMeasurement(runId, workflow.request, "prefix");
 				pi.sendUserMessage(
 					`${workflow.request}\n\nWarning: a delegated subagent attempt failed and may have produced side effects; inspect the current state before repeating work.`,

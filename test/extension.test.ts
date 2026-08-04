@@ -228,6 +228,7 @@ class Harness {
 	readonly lifecycleTransitions: string[] = [];
 	readonly setModelCalls: Model[] = [];
 	readonly thinkingCalls: string[] = [];
+	thinkingLevel: string | undefined;
 	readonly resolvedSelectors: string[] = [];
 	readonly classifierPrompts: string[] = [];
 	current: TestModel | undefined = base;
@@ -299,8 +300,12 @@ class Harness {
 				if (result) self.current = selected as TestModel;
 				return result;
 			},
+			getThinkingLevel(): string | undefined {
+				return self.thinkingLevel;
+			},
 			setThinkingLevel(level: string): void {
 				self.thinkingCalls.push(level);
+				self.thinkingLevel = level;
 			},
 			registerMessageRenderer(customType: string, renderer: CapturedRenderer): void {
 				self.renderers.set(customType, renderer);
@@ -797,7 +802,7 @@ describe("model router extension", () => {
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["slow"]);
 	});
 
-	it("avoids same-model resets, clamps effort, and does not mutate thinking for plain targets", async () => {
+	it("restores prior thinking before a subsequent plain automatic target", async () => {
 		const harness = new Harness();
 		harness.current = smol;
 		harness.classifications = ["medium", "high"];
@@ -808,7 +813,22 @@ describe("model router extension", () => {
 		expect(harness.thinkingCalls).toEqual(["medium"]);
 		await harness.input("hard work");
 		expect(harness.setModelCalls.map(selected => selected.id)).toEqual(["plain"]);
-		expect(harness.thinkingCalls).toEqual(["medium"]);
+		expect(harness.thinkingCalls).toEqual(["medium", "inherit"]);
+	});
+	it("restores baseline thinking after a same-model automatic turn", async () => {
+		const harness = new Harness();
+		harness.config = routerConfig({ thresholds: { low: ["@smol"], high: ["mock/base"] } });
+		harness.classifications = ["high"];
+		await harness.lifecycle();
+		await harness.input("same model but higher effort");
+
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.thinkingCalls).toEqual(["high"]);
+
+		await harness.agentEnd(false);
+
+		expect(harness.thinkingCalls).toEqual(["high", "inherit"]);
+		expect(harness.thinkingLevel).toBe("inherit");
 	});
 
 	it("clamps unsupported high effort downward on a reasoning model", async () => {
@@ -1500,6 +1520,25 @@ describe("model router delegation", () => {
 		expect(harness.userMessages[0]?.content).toContain("the original standalone request");
 		expect(harness.userMessages[0]?.content).toContain("side effects");
 		expect(harness.delegationEntries().at(-1)).toMatchObject({ status: "failed" });
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol"]);
+		expect(harness.current).toBe(smol);
+		await harness.agentEnd(false);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
+		expect(harness.current).toBe(base);
+	});
+	it("keeps the routed model through a child-failure follow-up", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		harness.executeResults = [singleResult({ exitCode: 1, error: "child exploded", output: "" })];
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.userMessages.length === 1);
+
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol"]);
+		expect(harness.current).toBe(smol);
+
+		await harness.agentEnd(false);
+
 		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "base"]);
 		expect(harness.current).toBe(base);
 	});
