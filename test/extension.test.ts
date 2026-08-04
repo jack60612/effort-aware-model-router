@@ -1655,6 +1655,32 @@ describe("model router delegation", () => {
 		expect(stateEntryCountAfterChildCompletion).toBe(stateEntryCountBeforeChildCompletion);
 	});
 
+	it("defers a detached restore while a manual selector switch is pending", async () => {
+		const harness = await enabledHarness();
+		harness.classifications = ["low"];
+		harness.planResults = [{ delegate: true, agent: "scout", task: "standalone task assignment" }];
+		const deferredResult = Promise.withResolvers<SingleResult>();
+		harness.executeResults = [() => deferredResult.promise];
+
+		await harness.input("the original standalone request");
+		await harness.settle(() => harness.executeCalls.length === 1);
+
+		const manualSwitch = Promise.withResolvers<boolean>();
+		harness.setModelResults = [() => manualSwitch.promise];
+		const command = harness.command("manual @slow");
+		await harness.settle(() => harness.setModelCalls.length === 2);
+
+		deferredResult.resolve(singleResult({ output: "child output text" }));
+		await harness.settle(() => harness.customMessages.length === 1);
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "slow"]);
+
+		manualSwitch.resolve(false);
+		await command;
+		expect(harness.setModelCalls.map(model => model.id)).toEqual(["smol", "slow", "base"]);
+		expect(harness.state().mode).toBe("auto");
+		expect(harness.current).toBe(base);
+	});
+
 	it("reports no active workflow for /route cancel when idle", async () => {
 		const harness = await enabledHarness();
 		await harness.command("cancel");

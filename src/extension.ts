@@ -332,6 +332,7 @@ export function createModelRouterExtension(
 		let automaticRouteGeneration: number | undefined;
 		let automaticRouteTokenSequence = 0;
 		let automaticRouteToken: number | undefined;
+		let manualControlPending = false;
 		/** FIFO turn fence because public agent_end has no turn/session identifier. */
 		const automaticMainTurns: AutomaticMainTurn[] = [];
 		/** Serializes router-owned baseline restores with later router controls and inputs. */
@@ -456,6 +457,8 @@ export function createModelRouterExtension(
 
 		const transitionManual = async (ctx: ExtensionContext, selector: string | undefined): Promise<void> => {
 			const runtime = ensureState(ctx);
+			const automaticOwnerGeneration = automaticRouteGeneration;
+			const automaticOwnerToken = automaticRouteToken;
 			let selected = currentModel(ctx);
 			if (selector) {
 				selected = ctx.models.resolve(selector);
@@ -469,6 +472,14 @@ export function createModelRouterExtension(
 					return;
 				}
 				if (!modelsEqual(currentModel(ctx), selected) && !(await switchModel(selected))) {
+					if (automaticOwnerGeneration !== undefined && automaticOwnerToken !== undefined) {
+						await restoreAutomaticBaseline(
+							ctx,
+							automaticOwnerGeneration,
+							automaticOwnerToken,
+							true,
+						);
+					}
 					warnOnce(
 						ctx,
 						`manual-auth:${selector}`,
@@ -498,7 +509,9 @@ export function createModelRouterExtension(
 			ctx: ExtensionContext,
 			generation: number,
 			expectedToken?: number,
+			allowDuringManualControl = false,
 		): Promise<void> => {
+			if (expectedToken !== undefined && manualControlPending && !allowDuringManualControl) return;
 			if (
 				automaticRouteGeneration !== generation ||
 				(expectedToken !== undefined && automaticRouteToken !== expectedToken)
@@ -538,6 +551,7 @@ export function createModelRouterExtension(
 				automaticRouteGeneration !== generation ||
 				(expectedToken !== undefined && automaticRouteToken !== expectedToken) ||
 				runtime.mode !== "auto" ||
+				(!allowDuringManualControl && manualControlPending) ||
 				!modelsEqual(runtime.lastAutoModel ?? undefined, identityOf(activeModel) ?? undefined)
 			) {
 				return;
@@ -559,9 +573,10 @@ export function createModelRouterExtension(
 			ctx: ExtensionContext,
 			generation: number,
 			expectedToken?: number,
+			allowDuringManualControl = false,
 		): Promise<void> => {
 			const run = automaticRestorePromise.then(() =>
-				restoreAutomaticBaselineNow(ctx, generation, expectedToken),
+				restoreAutomaticBaselineNow(ctx, generation, expectedToken, allowDuringManualControl),
 			);
 			automaticRestorePromise = run.catch(() => undefined);
 			return run;
@@ -581,7 +596,7 @@ export function createModelRouterExtension(
 			if (!pending || pending.stale) return;
 			pending.stale = true;
 			pending.settled = true;
-			await restoreAutomaticBaseline(ctx, pending.generation, pending.routeToken);
+			await restoreAutomaticBaseline(ctx, pending.generation, pending.routeToken, true);
 		};
 
 		/** True once a guarded route was superseded: aborted, or claimed under an older delegation generation. */
@@ -946,6 +961,7 @@ export function createModelRouterExtension(
 			ctx: ExtensionContext,
 			workflow: DelegationWorkflow,
 		): Promise<void> => {
+			const { runId, controller } = workflow;
 			/** Keep cancellation entries behind the awaited restore/release settlement. */
 			let cancelledDetail: Record<string, unknown> | undefined;
 			let replayOriginalPending = false;
@@ -1227,9 +1243,14 @@ export function createModelRouterExtension(
 					return;
 				}
 				if (command === "manual" && parts.length <= 2) {
-					await waitForAutomaticRestore();
-					await settlePendingAutomaticMainTurn(ctx);
-					await transitionManual(ctx, parts[1]);
+					manualControlPending = true;
+					try {
+						await waitForAutomaticRestore();
+						await settlePendingAutomaticMainTurn(ctx);
+						await transitionManual(ctx, parts[1]);
+					} finally {
+						manualControlPending = false;
+					}
 					return;
 				}
 				if (command === "off" && parts.length === 1) {
