@@ -673,14 +673,20 @@ describe("model router extension", () => {
 		const modelInput = harness.input("/model @smol").then(() => {
 			modelSettled = true;
 		});
+		let pickerSettled = false;
+		const pickerInput = harness.input("/model").then(() => {
+			pickerSettled = true;
+		});
 		await Promise.resolve();
 		expect(offSettled).toBe(false);
 		expect(modelSettled).toBe(false);
+		expect(pickerSettled).toBe(false);
 
 		pending.resolve(true);
 		await restore;
 		await off;
 		await modelInput;
+		await pickerInput;
 		expect(harness.state().mode).toBe("off");
 		expect(harness.current).toBe(base);
 	});

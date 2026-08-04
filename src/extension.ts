@@ -1382,7 +1382,7 @@ export function createModelRouterExtension(
 				return { handled: true };
 			}
 			const text = event.text.trim();
-			if (text.startsWith("/model ")) {
+			if (text === "/model" || text.startsWith("/model ")) {
 				await waitForAutomaticRestore();
 				await settlePendingAutomaticMainTurn(ctx);
 				return;
